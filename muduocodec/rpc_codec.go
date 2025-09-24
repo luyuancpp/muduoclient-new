@@ -86,7 +86,7 @@ func (c *RpcCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
 
 // Decode：解码 TCP 数据为 RPC 消息（基于 gnet Peek 接口，非消费式读取）
 // 输入：gnet.Conn（从连接读取数据，缓存未处理数据）
-// 输出：nil（解码结果存储在 conn.Context().(*rpcConnContext).msg 中）、错误信息
+// 输出：nil（解码结果存储在 conn.Context().(*rpcConnContext).Msg 中）、错误信息
 func (c *RpcCodec) Decode(conn gnet.Conn) ([]byte, error) {
 	// 1. 初始化/获取连接上下文
 	ctx, ok := conn.Context().(*rpcConnContext)

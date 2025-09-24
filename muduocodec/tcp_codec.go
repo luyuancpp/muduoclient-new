@@ -16,10 +16,10 @@ import (
 // TcpCodec: 通用Protobuf编解码器（基于gnet.Peek接口）
 // -----------------------------------------------------------------------------
 
-// connContext: TcpCodec的连接上下文（缓存未消费数据+解码后的消息）
-type connContext struct {
+// ConnContext: TcpCodec的连接上下文（缓存未消费数据+解码后的消息）
+type ConnContext struct {
 	cachedData []byte // 暂存未消费的Peek数据
-	msg        proto.Message
+	Msg        proto.Message
 }
 
 type TcpCodec struct{}
@@ -30,13 +30,13 @@ func NewTcpCodec() *TcpCodec {
 
 // Encode: 编码Proto消息为TCP协议格式
 func (c *TcpCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
-	ctx, ok := conn.Context().(*connContext)
-	if !ok || ctx.msg == nil {
+	ctx, ok := conn.Context().(*ConnContext)
+	if !ok || ctx.Msg == nil {
 		return nil, nil // 无待发送消息
 	}
 
 	// 1. 获取Proto消息描述符和类型名
-	desc := ctx.msg.ProtoReflect().Descriptor()
+	desc := ctx.Msg.ProtoReflect().Descriptor()
 	if desc == nil {
 		return nil, errors.New("empty message descriptor")
 	}
@@ -45,7 +45,7 @@ func (c *TcpCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
 	nameLen := uint32(len(msgTypeNameData))
 
 	// 2. 序列化Proto消息体（v2接口）
-	msgBody, err := proto.MarshalOptions{}.Marshal(ctx.msg)
+	msgBody, err := proto.MarshalOptions{}.Marshal(ctx.Msg)
 	if err != nil {
 		return nil, err
 	}
@@ -78,9 +78,9 @@ func (c *TcpCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
 // Decode: 基于Peek接口解码TCP协议包
 func (c *TcpCodec) Decode(conn gnet.Conn) ([]byte, error) {
 	// 1. 获取/初始化连接上下文
-	ctx, ok := conn.Context().(*connContext)
+	ctx, ok := conn.Context().(*ConnContext)
 	if !ok {
-		ctx = &connContext{cachedData: make([]byte, 0, 4096)} // 预分配缓存
+		ctx = &ConnContext{cachedData: make([]byte, 0, 4096)} // 预分配缓存
 		conn.SetContext(ctx)
 	}
 
@@ -178,7 +178,7 @@ func (c *TcpCodec) Decode(conn gnet.Conn) ([]byte, error) {
 			ctx.cachedData = append(ctx.cachedData, fullData[requiredTotalLen:]...)
 		}
 		// 保存解码结果
-		ctx.msg = msg
+		ctx.Msg = msg
 		break // 解析成功一个包，退出循环
 	}
 
