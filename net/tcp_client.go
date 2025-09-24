@@ -12,17 +12,10 @@ import (
 	"time"
 )
 
-// Codec: 编解码器接口（适配 Protobuf + gnet 异步读写）
 type Codec interface {
-	// Encode: 将 Protobuf 消息编码为完整 TCP 数据包（需包含长度/标签，解决粘包）
-	// 输入：proto.Message（业务消息）
-	// 输出：[]byte（完整数据包）、error（编码错误）
-	Encode(msg proto.Message) ([]byte, error)
+	Encode(conn gnet.Conn, msg proto.Message) ([]byte, error)
 
-	// Decode: 从字节流中解码 Protobuf 消息（处理粘包，返回已解码长度）
-	// 输入：[]byte（待解码数据，可能包含多个包或不完整包）
-	// 输出：proto.Message（解码后的消息）、uint32（已解码数据长度）、error（解码错误）
-	Decode(data []byte) (msg proto.Message, err error)
+	Decode(conn gnet.Conn) (err error)
 }
 
 // TcpClient: gnet 异步读写连接封装
@@ -83,7 +76,7 @@ func (ev *tcpClientEvents) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		c.SetContext(*cc)
 
 		// 2.1 调用编解码器解码（返回完整消息+已解码长度）
-		_, err := tcpClient.codec.Decode(tempBuf)
+		err := tcpClient.codec.Decode(c)
 
 		// 2.2 处理解码结果
 		switch {

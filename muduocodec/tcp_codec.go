@@ -29,14 +29,9 @@ func NewTcpCodec() *TcpCodec {
 }
 
 // Encode: 编码Proto消息为TCP协议格式
-func (c *TcpCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
-	ctx, ok := conn.Context().(*ConnContext)
-	if !ok || ctx.Msg == nil {
-		return nil, nil // 无待发送消息
-	}
-
+func (c *TcpCodec) Encode(conn gnet.Conn, msg proto.Message) ([]byte, error) {
 	// 1. 获取Proto消息描述符和类型名
-	desc := ctx.Msg.ProtoReflect().Descriptor()
+	desc := msg.ProtoReflect().Descriptor()
 	if desc == nil {
 		return nil, errors.New("empty message descriptor")
 	}
@@ -45,7 +40,7 @@ func (c *TcpCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
 	nameLen := uint32(len(msgTypeNameData))
 
 	// 2. 序列化Proto消息体（v2接口）
-	msgBody, err := proto.MarshalOptions{}.Marshal(ctx.Msg)
+	msgBody, err := proto.MarshalOptions{}.Marshal(msg)
 	if err != nil {
 		return nil, err
 	}
@@ -75,112 +70,97 @@ func (c *TcpCodec) Encode(conn gnet.Conn, _ []byte) ([]byte, error) {
 	return fullPacket, nil
 }
 
-// Decode: 基于Peek接口解码TCP协议包
-func (c *TcpCodec) Decode(conn gnet.Conn) ([]byte, error) {
+func (c *TcpCodec) Decode(conn gnet.Conn) error {
 	// 1. 获取/初始化连接上下文
 	ctx, ok := conn.Context().(*ConnContext)
 	if !ok {
-		ctx = &ConnContext{cachedData: make([]byte, 0, 4096)} // 预分配缓存
+		ctx = &ConnContext{cachedData: make([]byte, 0, 4096)}
 		conn.SetContext(ctx)
 	}
 
 	// 2. 循环解析：处理粘包和拆包
 	for {
-		// 2.1 合并缓存数据和新Peek数据
-		newData, err := conn.Peek(0)     // Peek所有可用新数据（n=0表示全部）
-		if err != nil && err != io.EOF { // EOF暂时忽略（对端关闭时后续会处理）
+		// 2.1 合并缓存数据和新Peek数据（Peek所有可用数据，不消费）
+		newData, err := conn.Peek(0)
+		if err != nil && err != io.EOF {
 			log.Println("Peek new data error:", err)
-			return nil, err
+			return err
 		}
 		fullData := append(ctx.cachedData, newData...)
-		ctx.cachedData = ctx.cachedData[:0] // 清空缓存
+		ctx.cachedData = ctx.cachedData[:0] // 清空旧缓存
 
-		// 2.2 第一步：解析总长度前缀（4字节）
+		// 2.2 解析总长度前缀（4字节）
 		if len(fullData) < 4 {
-			ctx.cachedData = append(ctx.cachedData, fullData...) // 缓存不足数据
-			return nil, ErrInsufficientData
+			ctx.cachedData = append(ctx.cachedData, fullData...)
+			return ErrInsufficientData
 		}
 		totalLen := binary.BigEndian.Uint32(fullData[:4])
-		requiredTotalLen := 4 + int(totalLen) // 完整包总长度（4字节长度+totalLen）
+		requiredTotalLen := 4 + int(totalLen) // 完整包总长度（长度前缀+数据+校验和）
 
-		// 2.3 第二步：检查是否有完整包
+		// 2.3 检查是否有完整包
 		if len(fullData) < requiredTotalLen {
-			ctx.cachedData = append(ctx.cachedData, fullData...) // 缓存不足数据
-			return nil, ErrInsufficientData
+			ctx.cachedData = append(ctx.cachedData, fullData...)
+			return ErrInsufficientData
 		}
 
-		// 2.4 第三步：分离msgData和校验和
-		msgData := fullData[4 : 4+int(totalLen)-4] // 修正：msgData部分
+		// 2.4 分离msgData和校验和（原有逻辑不变）
+		msgData := fullData[4 : 4+int(totalLen)-4]
 		checksumExpected := binary.BigEndian.Uint32(fullData[4+int(totalLen)-4 : 4+int(totalLen)])
 
-		// 校验和验证
+		// 校验和验证（失败直接返回，defer会自动Discard）
 		if adler32.Checksum(msgData) != checksumExpected {
 			log.Println("TcpCodec:", ErrInvalidChecksum)
-			// 消费错误包（读取并丢弃）
-			if _, readErr := readFixedLength(conn, requiredTotalLen); readErr != nil && readErr != ErrInsufficientData {
-				log.Println("Read invalid packet error:", readErr)
-			}
-			fullData = fullData[requiredTotalLen:] // 跳过错误包
-			continue
+			return ErrInvalidChecksum
 		}
 
-		// 2.5 第四步：解析类型名长度和类型名
-		if len(msgData) < 4 { // 至少需要4字节nameLen
+		// 2.5 解析类型名长度和类型名（失败直接返回，defer会自动Discard）
+		if len(msgData) < 4 {
 			log.Println("TcpCodec: insufficient data for nameLen")
-			if _, readErr := readFixedLength(conn, requiredTotalLen); readErr != nil && readErr != ErrInsufficientData {
-				log.Println("Read invalid nameLen packet error:", readErr)
-			}
-			fullData = fullData[requiredTotalLen:]
-			continue
+			return ErrInsufficientData
 		}
 		nameLen := binary.BigEndian.Uint32(msgData[:4])
-		if nameLen < 1 || int(nameLen+4) > len(msgData) { // 校验类型名长度合法性
+		if nameLen < 1 || int(nameLen+4) > len(msgData) {
 			log.Println("TcpCodec: invalid nameLen:", nameLen)
-			if _, readErr := readFixedLength(conn, requiredTotalLen); readErr != nil && readErr != ErrInsufficientData {
-				log.Println("Read invalid nameLen packet error:", readErr)
-			}
-			fullData = fullData[requiredTotalLen:]
-			continue
+			return ErrInvalidMsgName
 		}
 
-		// 2.6 第五步：解析Proto消息并反序列化
-		typeNameStr := string(msgData[4 : 4+nameLen-1]) // 去掉末尾空格
+		// 2.6 解析Proto消息并反序列化（失败直接返回，defer会自动Discard）
+		typeNameStr := string(msgData[4 : 4+nameLen-1]) // 注意：建议去掉末尾空格的逻辑，用FullName
 		msgType, err := protoregistry.GlobalTypes.FindMessageByName(protoreflect.FullName(typeNameStr))
 		if err != nil {
 			log.Printf("rpc codec: find message type failed (name=%s): %v", typeNameStr, err)
-			if _, readErr := readFixedLength(conn, requiredTotalLen); readErr != nil && readErr != ErrInsufficientData {
-				log.Println("Read invalid proto type packet error:", readErr)
-			}
-			fullData = fullData[requiredTotalLen:]
-			continue
+			return err
 		}
-
-		// 反序列化（使用v2标准接口）
 		bodyStart := 4 + nameLen
 		msg := msgType.New().Interface()
 		unmarshalOptions := proto.UnmarshalOptions{}
 		if err := unmarshalOptions.Unmarshal(msgData[bodyStart:], msg); err != nil {
 			log.Println("TcpCodec: unmarshal error:", err)
-			if _, readErr := readFixedLength(conn, requiredTotalLen); readErr != nil && readErr != ErrInsufficientData {
-				log.Println("Read unmarshal error packet error:", readErr)
-			}
-			fullData = fullData[requiredTotalLen:]
-			continue
+			return err
 		}
 
-		// 2.7 第六步：消费完整包+缓存剩余数据
-		if _, readErr := readFixedLength(conn, requiredTotalLen); readErr != nil {
-			log.Println("Read valid packet error:", readErr)
-			return nil, readErr
-		}
-		// 缓存剩余未处理数据（供下次解码）
+		// 2.7 缓存剩余未处理数据（若fullData包含多个包）
 		if len(fullData) > requiredTotalLen {
 			ctx.cachedData = append(ctx.cachedData, fullData[requiredTotalLen:]...)
 		}
-		// 保存解码结果
+
+		// -------------------------- 核心修改：用 Discard 替代 readFixedLength --------------------------
+		// 无论解析成功/失败，最终都要 Discard 已处理的 requiredTotalLen 字节
+		defer func() {
+			// 调用 Discard 消费数据（从缓冲区移除 requiredTotalLen 字节）
+			discarded, discardErr := conn.Discard(requiredTotalLen)
+			if discardErr != nil {
+				log.Printf("Discard failed: required %d, discarded %d, err: %v", requiredTotalLen, discarded, discardErr)
+			} else if discarded != requiredTotalLen {
+				// 极端情况：缓冲区数据被意外修改，Discard 长度不匹配（需告警）
+				log.Printf("Discard length mismatch: required %d, discarded %d", requiredTotalLen, discarded)
+			}
+		}()
+		// ----------------------------------------------------------------------------------------------
+		// 2.8 保存解码结果
 		ctx.Msg = msg
-		break // 解析成功一个包，退出循环
+		break
 	}
 
-	return nil, nil
+	return nil
 }
