@@ -142,20 +142,20 @@ func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 
 // OnTick: 定时心跳（简化连接读取与状态判断）
 func (ev *tcpClientEvents) OnTick() (delay time.Duration, action gnet.Action) {
-	delay = 10 * time.Second // 10秒心跳间隔
-	tcpClient := ev.client
+	//delay = 10 * time.Second // 10秒心跳间隔
+	//tcpClient := ev.client
 
 	// 未连接则跳过心跳
-	if !tcpClient.connected.Load() {
-		return delay, gnet.None
-	}
+	//if !tcpClient.connected.Load() {
+	//return delay, gnet.None
+	//}
 
 	// 原子读取连接（无锁）
-	conn, ok := tcpClient.conn.Load().(gnet.Conn)
-	if !ok || conn == nil {
-		return delay, gnet.None
-	}
-	connMeta := conn.Context().(*ConnMeta)
+	//conn, ok := tcpClient.conn.Load().(gnet.Conn)
+	//if !ok || conn == nil {
+	//return delay, gnet.None
+	//}
+	//connMeta := conn.Context().(*ConnMeta)
 
 	// 示例：发送心跳（替换为实际Protobuf结构体）
 	// heartbeatMsg := &pb.Heartbeat{
