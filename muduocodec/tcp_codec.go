@@ -29,7 +29,7 @@ func NewTcpCodec() *TcpCodec {
 }
 
 // Encode: 编码Proto消息为TCP协议格式
-func (c *TcpCodec) Encode(conn gnet.Conn, msg proto.Message) ([]byte, error) {
+func (c *TcpCodec) Encode(msg proto.Message) ([]byte, error) {
 	// 1. 获取Proto消息描述符和类型名
 	desc := msg.ProtoReflect().Descriptor()
 	if desc == nil {

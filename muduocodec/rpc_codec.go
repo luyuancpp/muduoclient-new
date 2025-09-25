@@ -25,16 +25,11 @@ type rpcConnContext struct {
 	msg        proto.Message // 解码成功后的 Protobuf 消息
 }
 
-// RpcCodec：RPC 编解码器核心结构
-// 注意：使用前必须通过 MsgType 字段指定预定义的 Protobuf 消息类型
 type RpcCodec struct {
 	MsgType proto.Message // 预定义的 RPC 消息类型（如 &pb.UserRequest{}）
 }
 
-// Encode：编码 RPC 消息为 TCP 数据包
-// 输入：gnet.Conn（从上下文获取待发送消息）
-// 输出：完整 TCP 数据包（含长度、标签、消息体、校验和）、错误信息
-func (c *RpcCodec) Encode(conn gnet.Conn, msg proto.Message) ([]byte, error) {
+func (c *RpcCodec) Encode(msg proto.Message) ([]byte, error) {
 
 	// 1. 固定 RPC 标签（4 字节 "RPC0"，用于解码时识别 RPC 包）
 	tag := []byte("RPC0")

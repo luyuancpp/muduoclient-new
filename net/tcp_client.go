@@ -13,7 +13,7 @@ import (
 )
 
 type Codec interface {
-	Encode(conn gnet.Conn, msg proto.Message) ([]byte, error)
+	Encode(msg proto.Message) ([]byte, error)
 
 	Decode(conn gnet.Conn) (err error)
 }
