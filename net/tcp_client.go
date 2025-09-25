@@ -13,78 +13,77 @@ import (
 	"time"
 )
 
-// ------------------------------ 核心接口与结构体定义（精简版） ------------------------------
+// ------------------------------ 核心接口与精简结构体 ------------------------------
 // Codec: 编解码器接口（不变）
 type Codec interface {
-	Encode(msg proto.Message) ([]byte, error)
-	Decode(conn gnet.Conn) error
+	Encode(msg proto.Message) ([]byte, error) // 编码Protobuf消息
+	Decode(conn gnet.Conn) error              // 解码到muduocodec上下文
 }
 
-// ConnMeta: 连接元数据（不变，仍绑定到conn）
+// ConnMeta: 连接元数据（仅绑定到conn，不冗余到TcpClient）
 type ConnMeta struct {
-	ConnID   string
-	CreateAt time.Time
+	ConnID   string    // 唯一连接标识（UUID）
+	CreateAt time.Time // 连接建立时间
 }
 
-// TcpClient: 精简后结构体（删除connID、connIDMutex）
+// TcpClient: 单连接精简版结构体（删除冗余锁和字段）
 type TcpClient struct {
-	codec     Codec              // 编解码器
+	codec     Codec              // 编解码器实例
 	closed    atomic.Bool        // 客户端关闭状态（原子变量）
 	ctx       context.Context    // 生命周期上下文
 	cancel    context.CancelFunc // 上下文取消函数
-	incoming  chan proto.Message // 接收通道
-	outgoing  chan []byte        // 发送通道
-	conn      atomic.Value       // 活跃连接（用原子变量替代connMutex）
-	wg        sync.WaitGroup     // 协程等待组
+	incoming  chan proto.Message // 业务层接收通道（带缓冲）
+	outgoing  chan []byte        // 业务层发送通道（带缓冲）
+	conn      atomic.Value       // 活跃连接（原子变量替代互斥锁）
+	wg        sync.WaitGroup     // 协程等待组（优雅关闭）
 	client    *gnet.Client       // gnet客户端实例
-	network   string             // 网络类型（tcp）
-	addr      string             // 服务器地址
-	multicore bool               // gnet多核模式
+	network   string             // 网络类型（固定tcp）
+	addr      string             // 服务器地址（如127.0.0.1:8080）
+	multicore bool               // gnet多核模式开关
 	connected atomic.Bool        // 连接状态（原子变量）
 }
 
-// tcpClientEvents: 事件处理器（不变）
+// tcpClientEvents: gnet事件处理器（绑定TcpClient）
 type tcpClientEvents struct {
-	*gnet.BuiltinEventEngine
-	client *TcpClient
+	*gnet.BuiltinEventEngine // 嵌入默认事件实现（减少重复代码）
+	client                   *TcpClient
 }
 
-// ------------------------------ 事件回调（简化锁与connID读取） ------------------------------
-// OnOpen: 连接建立（删除connIDMutex，直接绑定元数据）
+// ------------------------------ 事件回调（简化版） ------------------------------
+// OnOpen: 连接建立（仅绑定元数据，原子存储conn）
 func (ev *tcpClientEvents) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
 	tcpClient := ev.client
-	if tcpClient.closed.Load() { // 客户端已关闭，直接拒绝连接
+	// 客户端已关闭则直接拒绝连接
+	if tcpClient.closed.Load() {
 		return nil, gnet.Close
 	}
 
-	// 绑定元数据（无需同步到TcpClient的connID字段）
+	// 绑定元数据到conn（不同步到TcpClient）
 	connMeta := &ConnMeta{
 		ConnID:   uuid.NewString(),
 		CreateAt: time.Now(),
 	}
 	conn.SetContext(connMeta)
 
-	// 原子变量存储conn（替代connMutex.Lock/Unlock）
+	// 原子存储连接，更新状态
 	tcpClient.conn.Store(conn)
 	tcpClient.connected.Store(true)
+	log.Printf("已连接服务器: %s (connID: %s)", tcpClient.addr, connMeta.ConnID)
 
-	// 日志直接从元数据读connID
-	log.Printf("connected to server: %s (connID: %s)", tcpClient.addr, connMeta.ConnID)
 	return out, gnet.None
 }
 
-// OnClose: 连接关闭（删除connIDMutex，从元数据读connID）
+// OnClose: 连接关闭（原子清空conn，判断重连）
 func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 	tcpClient := ev.client
-
-	// 从元数据读connID（无需依赖TcpClient的connID字段）
-	connMeta, ok := conn.Context().(*ConnMeta)
+	// 从conn读取元数据（无需依赖TcpClient字段）
+	connMeta, _ := conn.Context().(*ConnMeta)
 	connID := "unknown"
-	if ok {
+	if connMeta != nil {
 		connID = connMeta.ConnID
 	}
 
-	// 仅当关闭的是当前活跃连接时，更新状态（单连接场景下基本必成立）
+	// 仅清空当前活跃连接（单连接场景无并发冲突）
 	if currentConn := tcpClient.conn.Load(); currentConn == conn {
 		tcpClient.conn.Store(nil)
 		tcpClient.connected.Store(false)
@@ -92,234 +91,251 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 
 	// 主动关闭场景：不重连
 	if tcpClient.closed.Load() {
-		log.Printf("conn %s closed (active shutdown)", connID)
+		log.Printf("连接关闭: %s (主动关闭)", connID)
 		return gnet.Shutdown
 	}
 
 	// 服务器正常关闭：不重连
 	if err == nil {
-		log.Printf("conn %s closed by server (normal)", connID)
+		log.Printf("连接关闭: %s (服务器正常关闭)", connID)
 		return gnet.None
 	}
 
-	// 意外断连：启动重连（简化日志）
-	log.Printf("conn %s closed (error: %v), start reconnect", connID, err)
+	// 意外断连：启动重连（独立协程避免阻塞gnet）
+	log.Printf("连接异常关闭: %s (err: %v)，启动重连", connID, err)
 	go tcpClient.reconnectLoop()
 
 	return gnet.None
 }
 
-// OnTraffic: 数据接收（简化connID读取）
+// OnTraffic: 数据接收（简化解码与消息投递）
 func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
-
-	// 同时获取编解码器上下文和元数据（避免二次类型断言）
+	// 读取编解码器上下文（muduocodec固定逻辑）
 	codecCtx, ok := conn.Context().(*muduocodec.ConnContext)
 	if !ok {
-		connMeta := conn.Context().(*ConnMeta)
-		log.Printf("OnTraffic: invalid ConnContext (connID: %s)", connMeta.ConnID)
+		connMeta, _ := conn.Context().(*ConnMeta)
+		log.Printf("数据接收异常: 无效上下文 (connID: %s)", connMeta.ConnID)
 		return gnet.None
 	}
-	connMeta := conn.Context().(*ConnMeta) // muduocodec.ConnContext 应嵌入 ConnMeta 或支持类型断言（若不支持，需调整元数据存储方式，见备注）
+	connMeta := conn.Context().(*ConnMeta)
 
-	// 解码逻辑不变
+	// 解码（仅处理非拆包错误）
 	decodeErr := tcpClient.codec.Decode(conn)
 	if decodeErr != nil && !errors.Is(decodeErr, muduocodec.ErrInsufficientData) {
-		log.Printf("OnTraffic: decode failed (connID: %s): %v", connMeta.ConnID, decodeErr)
+		log.Printf("解码失败 (connID: %s): %v", connMeta.ConnID, decodeErr)
 		return gnet.None
 	}
 
-	// 投递消息不变
+	// 非阻塞投递消息到业务层（避免阻塞gnet事件循环）
 	if codecCtx.Msg != nil {
 		select {
 		case tcpClient.incoming <- codecCtx.Msg:
-			codecCtx.Msg = nil
+			codecCtx.Msg = nil // 清空上下文供下次使用
 		default:
-			log.Printf("OnTraffic: incoming full (connID: %s), drop msg", connMeta.ConnID)
+			log.Printf("接收通道满 (connID: %s)，丢弃消息", connMeta.ConnID)
 		}
 	}
 
 	return gnet.None
 }
 
-// 备注：若 muduocodec.ConnContext 不支持嵌入 ConnMeta，可调整元数据存储方式：
-// 在 OnOpen 时，将 ConnMeta 存储到 codecCtx 中（如 codecCtx.Meta = connMeta），读取时通过 codecCtx.Meta 获取。
-
-// OnTick: 定时心跳（简化conn读取）
+// OnTick: 定时心跳（简化连接读取与状态判断）
 func (ev *tcpClientEvents) OnTick() (delay time.Duration, action gnet.Action) {
-	delay = 10 * time.Second
+	delay = 10 * time.Second // 10秒心跳间隔
 	tcpClient := ev.client
 
+	// 未连接则跳过心跳
 	if !tcpClient.connected.Load() {
 		return delay, gnet.None
 	}
 
-	// 原子变量读取conn（无需锁）
-	if conn, ok := tcpClient.conn.Load().(gnet.Conn); ok && conn != nil {
-		connMeta := conn.Context().(*ConnMeta)
-		// 心跳逻辑不变（示例）
-		// heartbeatMsg := &pb.Heartbeat{ConnID: connMeta.ConnID}
-		// if err := tcpClient.Send(heartbeatMsg); err != nil {
-		// 	log.Printf("OnTick: send heartbeat failed (connID: %s): %v", connMeta.ConnID, err)
-		// }
+	// 原子读取连接（无锁）
+	conn, ok := tcpClient.conn.Load().(gnet.Conn)
+	if !ok || conn == nil {
+		return delay, gnet.None
 	}
+	connMeta := conn.Context().(*ConnMeta)
+
+	// 示例：发送心跳（替换为实际Protobuf结构体）
+	// heartbeatMsg := &pb.Heartbeat{
+	// 	ConnID:    connMeta.ConnID,
+	// 	Timestamp: time.Now().Unix(),
+	// }
+	// if err := tcpClient.Send(heartbeatMsg); err != nil {
+	// 	log.Printf("心跳发送失败 (connID: %s): %v", connMeta.ConnID, err)
+	// }
 
 	return delay, gnet.None
 }
 
-// ------------------------------ 重连逻辑（大幅简化） ------------------------------
-// reconnectLoop: 简化日志，删除冗余的closedConnID参数
+// ------------------------------ 重连逻辑（简化版） ------------------------------
+// reconnectLoop: 退避重连（无冗余参数，单连接场景无需跟踪旧connID）
 func (c *TcpClient) reconnectLoop() {
-	reconnectDelay := 3 * time.Second
-	maxDelay := 30 * time.Second
-	retryCount := 0
+	reconnectDelay := 3 * time.Second // 初始重连间隔
+	maxDelay := 30 * time.Second      // 最大重连间隔（避免频繁重试）
+	retryCount := 0                   // 重试次数
 
 	for {
-		// 客户端已关闭：终止重连
+		// 客户端已关闭则终止重连
 		if c.closed.Load() {
-			log.Println("reconnect: client closed, stop")
+			log.Println("重连终止：客户端已关闭")
 			return
 		}
 
-		// 简化日志：仅打印核心信息
-		log.Printf("reconnect: retry %d, delay %v", retryCount+1, reconnectDelay)
+		// 打印简洁重连日志
+		log.Printf("重连尝试 %d (间隔: %v) - 目标服务器: %s", retryCount+1, reconnectDelay, c.addr)
 		time.Sleep(reconnectDelay)
 
-		// 尝试重连（逻辑不变）
+		// 尝试建立新连接（gnet.Dial自动触发OnOpen）
 		newConn, err := c.client.Dial(c.network, c.addr)
 		if err == nil {
-			log.Printf("reconnect: success (new connID: %s)", newConn.Context().(*ConnMeta).ConnID)
+			// 重连成功：从新conn读取元数据
+			newConnMeta := newConn.Context().(*ConnMeta)
+			log.Printf("重连成功 (新connID: %s)", newConnMeta.ConnID)
 			return
 		}
 
-		// 退避算法不变
+		// 重连失败：更新退避间隔（翻倍，不超过最大值）
 		retryCount++
 		reconnectDelay *= 2
 		if reconnectDelay > maxDelay {
 			reconnectDelay = maxDelay
 		}
-		log.Printf("reconnect: failed (retry %d): %v, next delay %v", retryCount, err, reconnectDelay)
+		log.Printf("重连失败 (尝试 %d): %v，下次间隔: %v", retryCount, err, reconnectDelay)
 	}
 }
 
-// ------------------------------ 客户端初始化与启动（不变，仅适配原子变量） ------------------------------
+// ------------------------------ 客户端初始化（简化配置） ------------------------------
+// ClientConfig: 精简配置（仅保留核心参数）
 type ClientConfig struct {
-	Multicore bool
-	Async     bool
-	Writev    bool
+	Multicore bool // 是否启用gnet多核模式（单连接场景建议关闭）
 }
 
+// DefaultClientConfig: 默认配置（单连接场景最优）
 func DefaultClientConfig() *ClientConfig {
-	return &ClientConfig{Multicore: false, Async: false, Writev: false}
+	return &ClientConfig{Multicore: false}
 }
 
+// NewTcpClient: 简化创建接口（默认配置）
 func NewTcpClient(addr string, codec Codec) *TcpClient {
 	return NewTcpClientWithConfig(addr, codec, DefaultClientConfig())
 }
 
+// NewTcpClientWithConfig: 全配置创建（支持自定义多核模式）
 func NewTcpClientWithConfig(addr string, codec Codec, conf *ClientConfig) *TcpClient {
+	// 初始化生命周期上下文
 	ctx, cancel := context.WithCancel(context.Background())
+
 	client := &TcpClient{
 		codec:     codec,
 		ctx:       ctx,
 		cancel:    cancel,
-		incoming:  make(chan proto.Message, 200),
-		outgoing:  make(chan []byte, 200),
+		incoming:  make(chan proto.Message, 200), // 200缓冲避免业务层阻塞
+		outgoing:  make(chan []byte, 200),        // 200缓冲应对突发发送
 		network:   "tcp",
 		addr:      addr,
 		multicore: conf.Multicore,
 	}
 
+	// 启动核心协程（仅2个：异步发送+gnet引擎）
 	client.wg.Add(2)
 	go client.asyncWriteLoop()
-	go client.startGnetClient(conf)
+	go client.startGnetClient()
+
 	return client
 }
 
-func (c *TcpClient) startGnetClient(conf *ClientConfig) {
+// startGnetClient: 启动gnet引擎（简化错误处理）
+func (c *TcpClient) startGnetClient() {
 	defer c.wg.Done()
 
+	// 初始化gnet事件处理器
 	gnetEvents := &tcpClientEvents{
 		BuiltinEventEngine: &gnet.BuiltinEventEngine{},
 		client:             c,
 	}
 
-	// 创建gnet客户端（不变）
+	// 创建gnet客户端（核心参数配置）
 	gnetClient, err := gnet.NewClient(
 		gnetEvents,
-		gnet.WithMulticore(conf.Multicore),
-		gnet.WithTCPNoDelay(gnet.TCPNoDelay),
-		gnet.WithLockOSThread(true),
-		gnet.WithTicker(true),
+		gnet.WithMulticore(c.multicore),      // 多核模式（按配置）
+		gnet.WithTCPNoDelay(gnet.TCPNoDelay), // 禁用Nagle算法（减少延迟）
+		gnet.WithLockOSThread(true),          // 绑定线程（提升性能）
+		gnet.WithTicker(true),                // 启用定时回调（支持心跳）
 	)
 	if err != nil {
-		log.Fatalf("startGnetClient: create failed: %v", err)
+		log.Fatalf("gnet客户端创建失败: %v", err)
 	}
 	c.client = gnetClient
 
-	// 启动gnet（不变）
+	// 启动gnet（非阻塞）
 	if err := c.client.Start(); err != nil {
-		log.Fatalf("startGnetClient: start failed: %v", err)
+		log.Fatalf("gnet引擎启动失败: %v", err)
 	}
 
-	// 延迟关闭（不变）
+	// 延迟关闭gnet（确保退出时清理）
 	defer func() {
-		if err := c.client.Stop(); err != nil {
-			log.Printf("startGnetClient: stop failed: %v", err)
+		if stopErr := c.client.Stop(); stopErr != nil {
+			log.Printf("gnet引擎关闭失败: %v", stopErr)
+		} else {
+			log.Println("gnet引擎正常关闭")
 		}
 	}()
 
-	// 初始连接（不变）
+	// 建立初始连接（失败则退出）
 	initialConn, err := c.client.Dial(c.network, c.addr)
 	if err != nil {
-		log.Fatalf("startGnetClient: initial dial failed: %v", err)
+		log.Fatalf("初始连接失败: %v", err)
 	}
-	log.Printf("startGnetClient: initial conn success (connID: %s)", initialConn.Context().(*ConnMeta).ConnID)
+	initialConnMeta := initialConn.Context().(*ConnMeta)
+	log.Printf("初始连接成功 (connID: %s)", initialConnMeta.ConnID)
 
-	// 等待关闭（不变）
+	// 阻塞等待客户端关闭
 	<-c.ctx.Done()
-	log.Println("startGnetClient: exiting")
+	log.Println("gnet协程退出")
 }
 
-// ------------------------------ 异步发送与关闭（简化锁） ------------------------------
-// asyncWriteLoop: 用原子变量读取conn，删除connMutex
+// ------------------------------ Send及后续核心函数（优化版） ------------------------------
+// asyncWriteLoop: 异步发送协程（无锁，原子读取conn）
 func (c *TcpClient) asyncWriteLoop() {
 	defer c.wg.Done()
 
 	for {
 		select {
-		case <-c.ctx.Done():
-			log.Println("asyncWriteLoop: exiting (ctx closed)")
+		case <-c.ctx.Done(): // 客户端关闭信号
+			log.Println("异步发送协程退出：上下文关闭")
 			return
-		case data, ok := <-c.outgoing:
-			if !ok {
-				log.Println("asyncWriteLoop: exiting (outgoing closed)")
+
+		case data, ok := <-c.outgoing: // 从业务层接收待发送数据
+			if !ok { // 发送通道被关闭（Close函数触发）
+				log.Println("异步发送协程退出：发送通道关闭")
 				return
 			}
 
-			// 双重校验：先判断状态，再读conn（避免无效操作）
+			// 双重状态校验（原子操作，无锁）
 			if c.closed.Load() || !c.connected.Load() {
-				log.Println("asyncWriteLoop: skip send (client closed or not connected)")
+				log.Printf("跳过发送（数据长度: %d）：客户端关闭或未连接", len(data))
 				continue
 			}
 
-			// 原子变量读取conn（无需锁）
+			// 原子读取连接（无锁，避免并发冲突）
 			conn, ok := c.conn.Load().(gnet.Conn)
 			if !ok || conn == nil {
-				log.Println("asyncWriteLoop: skip send (no conn)")
+				log.Printf("跳过发送（数据长度: %d）：无活跃连接", len(data))
 				continue
 			}
-
-			// 异步写（不变，简化connID读取）
 			connMeta := conn.Context().(*ConnMeta)
+
+			// 调用gnet异步写（不阻塞当前协程）
 			err := conn.AsyncWrite(data, func(_ gnet.Conn, err error) error {
 				if err != nil {
-					log.Printf("asyncWriteLoop: send failed (connID: %s, len: %d): %v", connMeta.ConnID, len(data), err)
+					log.Printf("发送失败 (connID: %s, 数据长度: %d): %v", connMeta.ConnID, len(data), err)
 				}
 				return err
 			})
 			if err != nil {
-				log.Printf("asyncWriteLoop: init send failed (connID: %s, len: %d): %v", connMeta.ConnID, len(data), err)
+				log.Printf("发送初始化失败 (connID: %s, 数据长度: %d): %v", connMeta.ConnID, len(data), err)
 			}
 		}
 	}
