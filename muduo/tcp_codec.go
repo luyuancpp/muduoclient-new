@@ -16,12 +16,6 @@ import (
 // TcpCodec: 通用Protobuf编解码器（基于gnet.Peek接口）
 // -----------------------------------------------------------------------------
 
-// ConnContext: TcpCodec的连接上下文（缓存未消费数据+解码后的消息）
-type ConnContext struct {
-	cachedData []byte // 暂存未消费的Peek数据
-	Msg        proto.Message
-}
-
 type TcpCodec struct{}
 
 func NewTcpCodec() *TcpCodec {

@@ -25,6 +25,14 @@ type ConnMeta struct {
 	CreateAt time.Time // 连接建立时间
 }
 
+// ConnContext: TcpCodec的连接上下文（缓存未消费数据+解码后的消息）
+type ConnContext struct {
+	ConnMeta                 // 嵌入连接元数据（继承 ConnID、CreateAt）
+	Msg        proto.Message // 解码后的 Protobuf 消息
+	cachedData []byte        // 拆包剩余的缓冲数据
+	// ... 其他编解码器需要的字段
+}
+
 // TcpClient: 单连接精简版结构体（删除冗余锁和字段）
 type TcpClient struct {
 	codec     Codec              // 编解码器实例
@@ -49,25 +57,30 @@ type tcpClientEvents struct {
 }
 
 // ------------------------------ 事件回调（简化版） ------------------------------
-// OnOpen: 连接建立（仅绑定元数据，原子存储conn）
 func (ev *tcpClientEvents) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
 	tcpClient := ev.client
-	// 客户端已关闭则直接拒绝连接
 	if tcpClient.closed.Load() {
 		return nil, gnet.Close
 	}
 
-	// 绑定元数据到conn（不同步到TcpClient）
-	connMeta := &ConnMeta{
-		ConnID:   uuid.NewString(),
-		CreateAt: time.Now(),
+	// 1. 初始化 ConnContext（同时包含元数据和编解码器状态）
+	connCtx := &ConnContext{
+		ConnMeta: ConnMeta{ // 初始化嵌入的元数据
+			ConnID:   uuid.NewString(),
+			CreateAt: time.Now(),
+		},
+		cachedData: make([]byte, 0, 4096), // 初始化缓冲（大小根据协议调整）
+		Msg:        nil,                   // 初始化为空消息
+		// ... 其他编解码器字段的初始化（如包长度计数器等）
 	}
-	conn.SetContext(connMeta)
 
-	// 原子存储连接，更新状态
+	// 2. 将 ConnContext 绑定到 conn（关键步骤！）
+	conn.SetContext(connCtx)
+
+	// 3. 原子存储连接和状态（原有逻辑不变）
 	tcpClient.conn.Store(conn)
 	tcpClient.connected.Store(true)
-	log.Printf("已连接服务器: %s (connID: %s)", tcpClient.addr, connMeta.ConnID)
+	log.Printf("已连接服务器: %s (connID: %s)", tcpClient.addr, connCtx.ConnID) // 直接从 connCtx 取 ConnID
 
 	return out, gnet.None
 }
@@ -110,29 +123,27 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 // OnTraffic: 数据接收（简化解码与消息投递）
 func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
-	// 读取编解码器上下文（muduocodec固定逻辑）
-	codecCtx, ok := conn.Context().(*ConnContext)
+	// 1. 读取 ConnContext（此时已包含 ConnMeta，不会为空）
+	connCtx, ok := conn.Context().(*ConnContext)
 	if !ok {
-		connMeta, _ := conn.Context().(*ConnMeta)
-		log.Printf("数据接收异常: 无效上下文 (connID: %s)", connMeta.ConnID)
+		log.Printf("数据接收异常: 无效的 ConnContext")
 		return gnet.None
 	}
-	connMeta := conn.Context().(*ConnMeta)
 
-	// 解码（仅处理非拆包错误）
-	decodeErr := tcpClient.codec.Decode(conn)
+	// 2. 解码（使用 connCtx 中的缓冲和状态，原有逻辑不变）
+	decodeErr := tcpClient.codec.Decode(conn) // 注意：Codec.Decode 需适配 ConnContext
 	if decodeErr != nil && !errors.Is(decodeErr, ErrInsufficientData) {
-		log.Printf("解码失败 (connID: %s): %v", connMeta.ConnID, decodeErr)
+		log.Printf("解码失败 (connID: %s): %v", connCtx.ConnID, decodeErr) // 从 connCtx 取 ConnID
 		return gnet.None
 	}
 
-	// 非阻塞投递消息到业务层（避免阻塞gnet事件循环）
-	if codecCtx.Msg != nil {
+	// 3. 投递消息（使用 connCtx 中的 Msg，原有逻辑不变）
+	if connCtx.Msg != nil {
 		select {
-		case tcpClient.incoming <- codecCtx.Msg:
-			codecCtx.Msg = nil // 清空上下文供下次使用
+		case tcpClient.incoming <- connCtx.Msg:
+			connCtx.Msg = nil // 清空消息供下次使用
 		default:
-			log.Printf("接收通道满 (connID: %s)，丢弃消息", connMeta.ConnID)
+			log.Printf("接收通道满 (connID: %s)，丢弃消息", connCtx.ConnID)
 		}
 	}
 
