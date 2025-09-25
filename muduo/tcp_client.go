@@ -1,10 +1,9 @@
-package net
+package muduocodec
 
 import (
 	"context"
 	"errors"
 	"github.com/google/uuid"
-	"github.com/luyuancpp/muduo-client-go/muduocodec"
 	"github.com/panjf2000/gnet/v2"
 	"google.golang.org/protobuf/proto"
 	"log"
@@ -112,7 +111,7 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
 	// 读取编解码器上下文（muduocodec固定逻辑）
-	codecCtx, ok := conn.Context().(*muduocodec.ConnContext)
+	codecCtx, ok := conn.Context().(*ConnContext)
 	if !ok {
 		connMeta, _ := conn.Context().(*ConnMeta)
 		log.Printf("数据接收异常: 无效上下文 (connID: %s)", connMeta.ConnID)
@@ -122,7 +121,7 @@ func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 
 	// 解码（仅处理非拆包错误）
 	decodeErr := tcpClient.codec.Decode(conn)
-	if decodeErr != nil && !errors.Is(decodeErr, muduocodec.ErrInsufficientData) {
+	if decodeErr != nil && !errors.Is(decodeErr, ErrInsufficientData) {
 		log.Printf("解码失败 (connID: %s): %v", connMeta.ConnID, decodeErr)
 		return gnet.None
 	}
