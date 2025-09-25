@@ -1,4 +1,4 @@
-package muduocodec
+package muduo
 
 import "errors"
 
