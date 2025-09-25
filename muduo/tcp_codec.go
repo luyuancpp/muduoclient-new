@@ -97,6 +97,19 @@ func (c *TcpCodec) Decode(conn gnet.Conn) error {
 			return ErrInsufficientData
 		}
 
+		// -------------------------- 核心修改：用 Discard 替代 readFixedLength --------------------------
+		// 无论解析成功/失败，最终都要 Discard 已处理的 requiredTotalLen 字节
+		defer func() {
+			// 调用 Discard 消费数据（从缓冲区移除 requiredTotalLen 字节）
+			discarded, discardErr := conn.Discard(requiredTotalLen)
+			if discardErr != nil {
+				log.Printf("Discard failed: required %d, discarded %d, err: %v", requiredTotalLen, discarded, discardErr)
+			} else if discarded != requiredTotalLen {
+				// 极端情况：缓冲区数据被意外修改，Discard 长度不匹配（需告警）
+				log.Printf("Discard length mismatch: required %d, discarded %d", requiredTotalLen, discarded)
+			}
+		}()
+
 		// 2.4 分离msgData和校验和（原有逻辑不变）
 		msgData := fullData[4 : 4+int(totalLen)-4]
 		checksumExpected := binary.BigEndian.Uint32(fullData[4+int(totalLen)-4 : 4+int(totalLen)])
@@ -138,18 +151,6 @@ func (c *TcpCodec) Decode(conn gnet.Conn) error {
 			ctx.cachedData = append(ctx.cachedData, fullData[requiredTotalLen:]...)
 		}
 
-		// -------------------------- 核心修改：用 Discard 替代 readFixedLength --------------------------
-		// 无论解析成功/失败，最终都要 Discard 已处理的 requiredTotalLen 字节
-		defer func() {
-			// 调用 Discard 消费数据（从缓冲区移除 requiredTotalLen 字节）
-			discarded, discardErr := conn.Discard(requiredTotalLen)
-			if discardErr != nil {
-				log.Printf("Discard failed: required %d, discarded %d, err: %v", requiredTotalLen, discarded, discardErr)
-			} else if discarded != requiredTotalLen {
-				// 极端情况：缓冲区数据被意外修改，Discard 长度不匹配（需告警）
-				log.Printf("Discard length mismatch: required %d, discarded %d", requiredTotalLen, discarded)
-			}
-		}()
 		// ----------------------------------------------------------------------------------------------
 		// 2.8 保存解码结果
 		ctx.Msg = msg
