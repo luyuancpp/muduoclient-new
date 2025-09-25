@@ -89,7 +89,7 @@ func (ev *tcpClientEvents) OnOpen(conn gnet.Conn) (out []byte, action gnet.Actio
 func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 	tcpClient := ev.client
 	// 从conn读取元数据（无需依赖TcpClient字段）
-	connMeta, _ := conn.Context().(*ConnMeta)
+	connMeta, _ := conn.Context().(*ConnContext)
 	connID := "unknown"
 	if connMeta != nil {
 		connID = connMeta.ConnID
@@ -201,7 +201,7 @@ func (c *TcpClient) reconnectLoop() {
 		newConn, err := c.client.Dial(c.network, c.addr)
 		if err == nil {
 			// 重连成功：从新conn读取元数据
-			newConnMeta := newConn.Context().(*ConnMeta)
+			newConnMeta := newConn.Context().(*ConnContext)
 			log.Printf("重连成功 (新connID: %s)", newConnMeta.ConnID)
 			return
 		}
@@ -298,7 +298,7 @@ func (c *TcpClient) startGnetClient() {
 	if err != nil {
 		log.Fatalf("初始连接失败: %v", err)
 	}
-	initialConnMeta := initialConn.Context().(*ConnMeta)
+	initialConnMeta := initialConn.Context().(*ConnContext)
 	log.Printf("初始连接成功 (connID: %s)", initialConnMeta.ConnID)
 
 	// 阻塞等待客户端关闭
@@ -335,7 +335,7 @@ func (c *TcpClient) asyncWriteLoop() {
 				log.Printf("跳过发送（数据长度: %d）：无活跃连接", len(data))
 				continue
 			}
-			connMeta := conn.Context().(*ConnMeta)
+			connMeta := conn.Context().(*ConnContext)
 
 			// 调用gnet异步写（不阻塞当前协程）
 			err := conn.AsyncWrite(data, func(_ gnet.Conn, err error) error {
