@@ -97,7 +97,7 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 
 	// 仅清空当前活跃连接（单连接场景无并发冲突）
 	if currentConn := tcpClient.conn.Load(); currentConn == conn {
-		tcpClient.conn.Store(nil)
+		tcpClient.conn.Store(&nilConn{})
 		tcpClient.connected.Store(false)
 	}
 
