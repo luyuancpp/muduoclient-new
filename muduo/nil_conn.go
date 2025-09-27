@@ -45,7 +45,7 @@ func (n *nilConn) SetWriteBuffer(bytes int) error {
 // ------------------------------ 实现 Conn 接口其他方法 ------------------------------
 
 // Context 返回用户定义的上下文，空实现返回 nil
-func (n *nilConn) Context() any {
+func (n *nilConn) Context() (ctx interface{}) {
 	return nil
 }
 
@@ -55,7 +55,7 @@ func (n *nilConn) EventLoop() gnet.EventLoop {
 }
 
 // SetContext 设置用户定义的上下文，空实现不做任何操作
-func (n *nilConn) SetContext(ctx any) {}
+func (n *nilConn) SetContext(ctx interface{}) {}
 
 // LocalAddr 返回本地地址，空实现返回 nil
 func (n *nilConn) LocalAddr() net.Addr {
