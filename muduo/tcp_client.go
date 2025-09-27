@@ -96,10 +96,7 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 	}
 
 	// 仅清空当前活跃连接（单连接场景无并发冲突）
-	if currentConn := tcpClient.conn.Load(); currentConn == conn {
-		tcpClient.conn.Store(&nilConn{})
-		tcpClient.connected.Store(false)
-	}
+	tcpClient.connected.Store(false)
 
 	// 主动关闭场景：不重连
 	if tcpClient.closed.Load() {
@@ -121,29 +118,46 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 }
 
 // OnTraffic: 数据接收（简化解码与消息投递）
+// OnTraffic: 循环调用 Decode 处理所有可解析的完整包
 func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
-	// 1. 读取 ConnContext（此时已包含 ConnMeta，不会为空）
+	// 1. 确保 ConnContext 已初始化（Decode 中也会初始化，但这里做双重保证）
 	connCtx, ok := conn.Context().(*ConnContext)
 	if !ok {
-		log.Printf("数据接收异常: 无效的 ConnContext")
-		return gnet.None
+		connCtx = &ConnContext{cachedData: make([]byte, 0, 4096)}
+		conn.SetContext(connCtx)
 	}
 
-	// 2. 解码（使用 connCtx 中的缓冲和状态，原有逻辑不变）
-	decodeErr := tcpClient.codec.Decode(conn) // 注意：Codec.Decode 需适配 ConnContext
-	if decodeErr != nil && !errors.Is(decodeErr, ErrInsufficientData) {
-		log.Printf("解码失败 (connID: %s): %v", connCtx.ConnID, decodeErr) // 从 connCtx 取 ConnID
-		return gnet.None
-	}
+	// 2. 循环解码，直到没有完整包可解析
+	for {
+		// 调用原 Decode 方法尝试解析一个完整包
+		decodeErr := tcpClient.codec.Decode(conn)
 
-	// 3. 投递消息（使用 connCtx 中的 Msg，原有逻辑不变）
-	if connCtx.Msg != nil {
-		select {
-		case tcpClient.incoming <- connCtx.Msg:
-			connCtx.Msg = nil // 清空消息供下次使用
-		default:
-			log.Printf("接收通道满 (connID: %s)，丢弃消息", connCtx.ConnID)
+		// 3. 根据解码结果判断是否继续循环
+		if decodeErr == nil {
+			// 解码成功：投递消息到业务层
+			if connCtx.Msg != nil {
+				select {
+				case tcpClient.incoming <- connCtx.Msg:
+					connCtx.Msg = nil // 清空消息，准备下一次解码
+				default:
+					log.Printf("接收通道满 (connID: %s)，丢弃消息", connCtx.ConnID)
+				}
+				// 继续循环：可能还有更多完整包
+				continue
+			}
+			// 解码成功但无消息（异常情况），退出循环
+			break
+
+		} else if errors.Is(decodeErr, ErrInsufficientData) {
+			// 数据不足（半包）：退出循环，等待下一次数据到达
+			break
+
+		} else {
+			// 其他解码错误（如校验和失败、格式错误）：
+			// 你的 Decode 中已通过 defer Discard 处理了无效数据，直接退出循环
+			log.Printf("解码错误 (connID: %s): %v", connCtx.ConnID, decodeErr)
+			break
 		}
 	}
 
@@ -202,6 +216,7 @@ func (c *TcpClient) reconnectLoop() {
 		if err == nil {
 			// 重连成功：从新conn读取元数据
 			newConnMeta := newConn.Context().(*ConnContext)
+			c.conn.Store(newConn)
 			log.Printf("重连成功 (新connID: %s)", newConnMeta.ConnID)
 			return
 		}
@@ -408,10 +423,9 @@ func (c *TcpClient) Close() {
 	close(c.outgoing)
 
 	// 4. 关闭活跃连接（仅日志，不中断后续清理）
-	if conn, ok := c.conn.Load().(gnet.Conn); ok && conn != nil {
-		if err := conn.Close(); err != nil {
-			log.Printf("连接关闭异常: %v", err)
-		}
+	err := c.client.Stop()
+	if err != nil {
+		return
 	}
 
 	// 5. 等待所有协程退出（确保资源清理完成）
