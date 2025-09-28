@@ -40,7 +40,6 @@ type TcpClient struct {
 	ctx       context.Context    // 生命周期上下文
 	cancel    context.CancelFunc // 上下文取消函数
 	incoming  chan proto.Message // 业务层接收通道（带缓冲）
-	outgoing  chan []byte        // 业务层发送通道（带缓冲）
 	conn      atomic.Value       // 活跃连接（原子变量替代互斥锁）
 	wg        sync.WaitGroup     // 协程等待组（优雅关闭）
 	client    *gnet.Client       // gnet客户端实例
@@ -257,15 +256,13 @@ func NewTcpClientWithConfig(addr string, codec Codec, conf *ClientConfig) *TcpCl
 		ctx:       ctx,
 		cancel:    cancel,
 		incoming:  make(chan proto.Message, 200), // 200缓冲避免业务层阻塞
-		outgoing:  make(chan []byte, 200),        // 200缓冲应对突发发送
 		network:   "tcp",
 		addr:      addr,
 		multicore: conf.Multicore,
 	}
 
 	// 启动核心协程（仅2个：异步发送+gnet引擎）
-	client.wg.Add(2)
-	go client.asyncWriteLoop()
+	client.wg.Add(1)
 	go client.startGnetClient()
 
 	return client
@@ -321,51 +318,6 @@ func (c *TcpClient) startGnetClient() {
 	log.Println("gnet协程退出")
 }
 
-// ------------------------------ Send及后续核心函数（优化版） ------------------------------
-// asyncWriteLoop: 异步发送协程（无锁，原子读取conn）
-func (c *TcpClient) asyncWriteLoop() {
-	defer c.wg.Done()
-
-	for {
-		select {
-		case <-c.ctx.Done(): // 客户端关闭信号
-			log.Println("异步发送协程退出：上下文关闭")
-			return
-
-		case data, ok := <-c.outgoing: // 从业务层接收待发送数据
-			if !ok { // 发送通道被关闭（Close函数触发）
-				log.Println("异步发送协程退出：发送通道关闭")
-				return
-			}
-
-			// 双重状态校验（原子操作，无锁）
-			if c.closed.Load() || !c.connected.Load() {
-				log.Printf("跳过发送（数据长度: %d）：客户端关闭或未连接", len(data))
-				continue
-			}
-
-			// 原子读取连接（无锁，避免并发冲突）
-			conn, ok := c.conn.Load().(gnet.Conn)
-			if !ok || conn == nil {
-				log.Printf("跳过发送（数据长度: %d）：无活跃连接", len(data))
-				continue
-			}
-			connMeta := conn.Context().(*ConnContext)
-
-			// 调用gnet异步写（不阻塞当前协程）
-			err := conn.AsyncWrite(data, func(_ gnet.Conn, err error) error {
-				if err != nil {
-					log.Printf("发送失败 (connID: %s, 数据长度: %d): %v", connMeta.ConnID, len(data), err)
-				}
-				return err
-			})
-			if err != nil {
-				log.Printf("发送初始化失败 (connID: %s, 数据长度: %d): %v", connMeta.ConnID, len(data), err)
-			}
-		}
-	}
-}
-
 // Send: 业务层发送接口（非阻塞，原子状态判断）
 func (c *TcpClient) Send(msg proto.Message) error {
 	// 1. 快速状态校验（原子操作，无锁）
@@ -382,13 +334,32 @@ func (c *TcpClient) Send(msg proto.Message) error {
 		return errors.Join(errors.New("消息编码失败"), err)
 	}
 
-	// 3. 非阻塞投递到发送通道（避免阻塞业务层）
-	select {
-	case c.outgoing <- data:
-		return nil
-	default:
-		return errors.New("发送失败：发送缓冲区已满（业务层发送过快）")
+	// 3. 原子读取连接（关键：避免并发时连接被替换/关闭）
+	connVal := c.conn.Load()
+	conn, ok := connVal.(gnet.Conn)
+	if !ok || conn == nil {
+		return errors.New("发送失败：无活跃连接")
 	}
+	// 从连接获取元数据（用于日志）
+	connCtx, _ := conn.Context().(*ConnContext)
+	connID := "unknown"
+	if connCtx != nil {
+		connID = connCtx.ConnID
+	}
+
+	// 4. 直接调用gnet异步写（非阻塞，但需处理回调）
+	err = conn.AsyncWrite(data, func(_ gnet.Conn, writeErr error) error {
+		if writeErr != nil {
+			log.Printf("发送失败 (connID: %s, 数据长度: %d): %v", connID, len(data), writeErr)
+		}
+		return writeErr
+	})
+	if err != nil {
+		// 这里的err是“启动异步写失败”（如连接已关闭），而非网络发送失败
+		return errors.Join(errors.New("发送初始化失败"), err)
+	}
+
+	return nil
 }
 
 // Recv: 业务层接收接口（阻塞，支持优雅退出）
@@ -420,7 +391,6 @@ func (c *TcpClient) Close() {
 	c.cancel()
 
 	// 3. 关闭发送通道（通知asyncWriteLoop退出）
-	close(c.outgoing)
 
 	// 4. 关闭活跃连接（仅日志，不中断后续清理）
 	err := c.client.Stop()
