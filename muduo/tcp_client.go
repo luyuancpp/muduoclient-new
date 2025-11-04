@@ -21,6 +21,10 @@ type Codec interface {
 // MessageCallback: 消息接收回调（业务层注册，接收完整消息后触发）
 type MessageCallback func(msg proto.Message, connCtx *ConnContext)
 
+// ------------------------------ 公共常量（核心补充） ------------------------------
+// ErrInsufficientData: 解码时数据不足（半包），供编解码器返回
+var ErrInsufficientData = errors.New("insufficient data for decoding")
+
 // ------------------------------ 核心结构体 ------------------------------
 // ConnMeta: 连接元数据（嵌入到ConnContext）
 type ConnMeta struct {
@@ -171,6 +175,32 @@ func (ev *tcpClientEvents) OnTick() (delay time.Duration, action gnet.Action) {
 	return delay, gnet.None
 }
 
+// ------------------------------ 核心工具方法（修复拨号问题） ------------------------------
+// dial: 自定义拨号逻辑，绑定ConnContext（修复gnet.Conn无自定义上下文问题）
+func (c *TcpClient) dial() (gnet.Conn, error) {
+	// 5秒拨号超时
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 底层TCP拨号
+	conn, err := gnet.DialContext(ctx, c.network, c.addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 绑定自定义ConnContext
+	connCtx := &ConnContext{
+		ConnMeta: ConnMeta{
+			ConnID:   uuid.NewString(),
+			CreateAt: time.Now(),
+		},
+		cachedData: make([]byte, 0, 4096),
+	}
+	conn.SetContext(connCtx)
+
+	return conn, nil
+}
+
 // ------------------------------ 重连逻辑 ------------------------------
 // reconnectLoop: 退避重连（避免频繁重试）
 func (c *TcpClient) reconnectLoop() {
@@ -189,8 +219,8 @@ func (c *TcpClient) reconnectLoop() {
 		log.Printf("reconnect attempt %d (delay: %v) - target: %s", retryCount+1, reconnectDelay, c.addr)
 		time.Sleep(reconnectDelay)
 
-		// 尝试建立新连接
-		newConn, err := c.client.Dial(c.network, c.addr)
+		// 修复：使用自定义dial()，确保绑定ConnContext
+		newConn, err := c.dial()
 		if err == nil {
 			newConnCtx := newConn.Context().(*ConnContext)
 			c.conn.Store(newConn)
@@ -281,8 +311,8 @@ func (c *TcpClient) startGnetClient() {
 		log.Fatalf("failed to start gnet engine: %v", err)
 	}
 
-	// 建立初始连接
-	initialConn, err := c.client.Dial(c.network, c.addr)
+	// 修复：使用自定义dial()建立初始连接
+	initialConn, err := c.dial()
 	if err != nil {
 		log.Fatalf("failed to establish initial connection: %v", err)
 	}
@@ -349,6 +379,15 @@ func (c *TcpClient) Close() {
 
 	// 触发所有协程退出
 	c.cancel()
+
+	// 关闭活跃连接（补充：避免连接泄露）
+	connVal := c.conn.Load()
+	if connVal != nil {
+		conn, ok := connVal.(gnet.Conn)
+		if ok && !c.IsClosed() {
+			conn.Close()
+		}
+	}
 
 	// 等待gnet协程退出
 	c.wg.Wait()
