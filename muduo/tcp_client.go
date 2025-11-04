@@ -21,10 +21,6 @@ type Codec interface {
 // MessageCallback: 消息接收回调（业务层注册，接收完整消息后触发）
 type MessageCallback func(msg proto.Message, connCtx *ConnContext)
 
-// ------------------------------ 公共常量（核心补充） ------------------------------
-// ErrInsufficientData: 解码时数据不足（半包），供编解码器返回
-var ErrInsufficientData = errors.New("insufficient data for decoding")
-
 // ------------------------------ 核心结构体 ------------------------------
 // ConnMeta: 连接元数据（嵌入到ConnContext）
 type ConnMeta struct {
@@ -183,7 +179,7 @@ func (c *TcpClient) dial() (gnet.Conn, error) {
 	defer cancel()
 
 	// 底层TCP拨号
-	conn, err := gnet.DialContext(ctx, c.network, c.addr)
+	conn, err := c.client.DialContext(c.network, c.addr, ctx)
 	if err != nil {
 		return nil, err
 	}
