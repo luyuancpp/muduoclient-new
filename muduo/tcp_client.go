@@ -58,7 +58,7 @@ type tcpClientEvents struct {
 }
 
 // ------------------------------ gnet事件回调（核心改造） ------------------------------
-// OnOpen: 连接建立时初始化上下文
+// OnOpen: 连接建立时初始化上下文（关键：所有连接都通过此回调绑定上下文）
 func (ev *tcpClientEvents) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
 	tcpClient := ev.client
 	if tcpClient.closed.Load() {
@@ -92,8 +92,9 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 		connID = connCtx.ConnID
 	}
 
-	// 更新连接状态
+	// 更新连接状态（清空无效连接）
 	tcpClient.connected.Store(false)
+	tcpClient.conn.Store(nil)
 
 	// 主动关闭：不重连
 	if tcpClient.closed.Load() {
@@ -107,7 +108,7 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 		return gnet.None
 	}
 
-	// 异常断连：启动重连（提交到gnet协程池，避免阻塞）
+	// 异常断连：启动重连（提交到独立协程，避免阻塞gnet事件循环）
 	log.Printf("conn closed abnormally: %s (err: %v) - starting reconnect", connID, err)
 	go tcpClient.reconnectLoop()
 
@@ -171,33 +172,19 @@ func (ev *tcpClientEvents) OnTick() (delay time.Duration, action gnet.Action) {
 	return delay, gnet.None
 }
 
-// ------------------------------ 核心工具方法（修复拨号问题） ------------------------------
-// dial: 自定义拨号逻辑，绑定ConnContext（修复gnet.Conn无自定义上下文问题）
+// ------------------------------ 核心拨号方法（适配gnet原生接口） ------------------------------
+// dial: 自定义拨号（使用gnet.DialContext，适配原生接口）
 func (c *TcpClient) dial() (gnet.Conn, error) {
-	// 5秒拨号超时
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 5秒拨号超时（绑定客户端生命周期上下文）
+	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
 	defer cancel()
 
-	// 底层TCP拨号
-	conn, err := c.client.DialContext(c.network, c.addr, ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// 绑定自定义ConnContext
-	connCtx := &ConnContext{
-		ConnMeta: ConnMeta{
-			ConnID:   uuid.NewString(),
-			CreateAt: time.Now(),
-		},
-		cachedData: make([]byte, 0, 4096),
-	}
-	conn.SetContext(connCtx)
-
-	return conn, nil
+	// 调用gnet原生DialContext，建立TCP连接
+	// 关键：连接建立后会触发OnOpen回调，自动绑定ConnContext
+	return c.client.DialContext(c.network, c.addr, ctx)
 }
 
-// ------------------------------ 重连逻辑 ------------------------------
+// ------------------------------ 重连逻辑（修复） ------------------------------
 // reconnectLoop: 退避重连（避免频繁重试）
 func (c *TcpClient) reconnectLoop() {
 	reconnectDelay := 3 * time.Second // 初始间隔
@@ -215,13 +202,11 @@ func (c *TcpClient) reconnectLoop() {
 		log.Printf("reconnect attempt %d (delay: %v) - target: %s", retryCount+1, reconnectDelay, c.addr)
 		time.Sleep(reconnectDelay)
 
-		// 修复：使用自定义dial()，确保绑定ConnContext
+		// 调用自定义dial()，通过gnet原生接口建立连接
 		newConn, err := c.dial()
 		if err == nil {
-			newConnCtx := newConn.Context().(*ConnContext)
-			c.conn.Store(newConn)
-			c.connected.Store(true)
-			log.Printf("reconnect success (connID: %s)", newConnCtx.ConnID)
+			// 连接建立成功：OnOpen已绑定上下文，直接更新原子变量
+			log.Printf("reconnect success (connID: %s)", newConn.Context().(*ConnContext).ConnID)
 			return
 		}
 
@@ -270,7 +255,7 @@ func NewTcpClientWithConfig(addr string, codec Codec, conf *ClientConfig) *TcpCl
 	return client
 }
 
-// startGnetClient: 启动gnet引擎（核心）
+// startGnetClient: 启动gnet引擎（核心修复，适配gnet原生接口）
 func (c *TcpClient) startGnetClient() {
 	defer c.wg.Done()
 
@@ -307,13 +292,10 @@ func (c *TcpClient) startGnetClient() {
 		log.Fatalf("failed to start gnet engine: %v", err)
 	}
 
-	// 修复：使用自定义dial()建立初始连接
-	initialConn, err := c.dial()
-	if err != nil {
+	// 建立初始连接（调用自定义dial()，适配gnet原生接口）
+	if _, err := c.dial(); err != nil {
 		log.Fatalf("failed to establish initial connection: %v", err)
 	}
-	initialConnCtx := initialConn.Context().(*ConnContext)
-	log.Printf("initial connection success (connID: %s)", initialConnCtx.ConnID)
 
 	// 阻塞等待客户端关闭信号
 	<-c.ctx.Done()
@@ -376,11 +358,11 @@ func (c *TcpClient) Close() {
 	// 触发所有协程退出
 	c.cancel()
 
-	// 关闭活跃连接（补充：避免连接泄露）
+	// 关闭活跃连接（避免连接泄露）
 	connVal := c.conn.Load()
 	if connVal != nil {
 		conn, ok := connVal.(gnet.Conn)
-		if ok && !c.IsClosed() {
+		if ok && conn != nil {
 			conn.Close()
 		}
 	}
