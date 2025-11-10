@@ -113,39 +113,31 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 }
 
 // OnTraffic: 数据接收（解码成功直接触发回调，无chan中转）
+// OnTraffic: 同一套逻辑兼容 TcpCodec 和 RpcCodec
 func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
-	connCtx, ok := conn.Context().(*ConnContext)
-	if !ok {
-		// 双重保证：创建无cachedData的默认上下文
-		connCtx = &ConnContext{}
-		conn.SetContext(connCtx)
-		return gnet.None
-	}
+	// 对于 RpcCodec，无需依赖 ConnContext 存储消息，仅需获取连接元数据（若需要）
+	connCtx, _ := conn.Context().(interface{}) // 兼容不同上下文结构
 
-	// 循环解码：处理所有可读的完整包
 	for {
-		// 调用编解码器解码（编解码器已基于gnet缓冲区，无本地缓存依赖）
+		// 调用编解码器解码（TcpCodec 和 RpcCodec 均返回 (proto.Message, error)）
 		msg, decodeErr := tcpClient.codec.Decode(conn)
 
 		switch {
 		case decodeErr == nil:
-			// 解码成功且有消息：触发回调
-			if msg != nil {
-				if tcpClient.msgCallback != nil {
-					// 注意：此处运行在gnet IO线程，回调不能耗时
-					tcpClient.msgCallback(msg, connCtx)
-				}
+			if msg != nil && tcpClient.msgCallback != nil {
+				// 回调传递消息和连接上下文（若 RpcCodec 无需上下文，可忽略第二个参数）
+				tcpClient.msgCallback(msg, connCtx.(*ConnContext)) // 按需类型转换
 			}
-			continue // 继续解码下一个包
+			continue
 
 		case errors.Is(decodeErr, ErrInsufficientData):
-			// 数据不足（半包）：退出循环，等待下一次数据到达
 			return gnet.None
 
 		default:
-			// 解码错误（格式错误/校验失败等）：记录日志后退出
-			log.Printf("decode error: %s (connID: %s, err: %v)", tcpClient.addr, connCtx.ConnID, decodeErr)
+			// 日志中添加连接标识
+			remoteAddr := conn.RemoteAddr().String()
+			log.Printf("decode error (conn: %s): %v", remoteAddr, decodeErr)
 			return gnet.None
 		}
 	}
