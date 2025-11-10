@@ -75,13 +75,18 @@ func (c *TcpCodec) Decode(conn gnet.Conn) error {
 	// 2. 循环解析：处理粘包和拆包
 	for {
 		// 2.1 合并缓存数据和新Peek数据（Peek所有可用数据，不消费）
+		// 每次循环只获取新数据，不重复拼接旧缓存
 		newData, err := conn.Peek(0)
 		if err != nil && err != io.EOF {
 			log.Println("Peek new data error:", err)
 			return err
 		}
-		fullData := append(ctx.cachedData, newData...)
-		ctx.cachedData = ctx.cachedData[:0] // 清空旧缓存
+		// 直接使用新数据+旧缓存，避免二次拷贝
+		fullData := make([]byte, 0, len(ctx.cachedData)+len(newData))
+		fullData = append(fullData, ctx.cachedData...)
+		fullData = append(fullData, newData...)
+		// 清空旧缓存（后续要么缓存剩余数据，要么丢弃）
+		ctx.cachedData = ctx.cachedData[:0]
 
 		// 2.2 解析总长度前缀（4字节）
 		if len(fullData) < 4 {
