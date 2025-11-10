@@ -12,9 +12,6 @@ import (
 	"time"
 )
 
-// 全局错误定义（补充之前缺失的ErrInsufficientData）
-var ErrInsufficientData = errors.New("insufficient data for packet")
-
 // Codec: 编解码器接口（业务层实现）
 type Codec interface {
 	Encode(msg proto.Message) ([]byte, error)     // 编码Protobuf消息
