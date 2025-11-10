@@ -12,15 +12,10 @@ import (
 	"time"
 )
 
-// 补充全局错误定义（确保编解码器的 ErrInsufficientData 在此可见）
-var (
-	ErrInsufficientData = errors.New("insufficient data for packet")
-)
-
 // Codec: 编解码器接口（业务层实现，不变）
 type Codec interface {
-	Encode(msg proto.Message) ([]byte, error) // 编码Protobuf消息
-	Decode(conn gnet.Conn) error              // 解码到ConnContext（需设置 connCtx.Msg）
+	Encode(msg proto.Message) ([]byte, error)     // 编码Protobuf消息
+	Decode(conn gnet.Conn) (proto.Message, error) // 解码到ConnContext（需设置 connCtx.Msg）
 }
 
 // MessageCallback: 消息接收回调（业务层注册，接收完整消息后触发）
@@ -35,9 +30,7 @@ type ConnMeta struct {
 
 // ConnContext: 连接上下文（绑定到gnet.Conn，仅存储元数据和解码结果）
 type ConnContext struct {
-	ConnMeta               // 嵌入元数据
-	Msg      proto.Message // 解码后的完整消息（Decode成功后设置）
-	// 核心优化：移除 cachedData 字段（编解码器已不依赖本地缓存）
+	ConnMeta // 嵌入元数据
 }
 
 // TcpClient: 精简TCP客户端（无chan，基于回调）
@@ -133,17 +126,16 @@ func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	// 循环解码：处理所有可读的完整包
 	for {
 		// 调用编解码器解码（编解码器已基于gnet缓冲区，无本地缓存依赖）
-		decodeErr := tcpClient.codec.Decode(conn)
+		msg, decodeErr := tcpClient.codec.Decode(conn)
 
 		switch {
 		case decodeErr == nil:
 			// 解码成功且有消息：触发回调
-			if connCtx.Msg != nil {
+			if msg != nil {
 				if tcpClient.msgCallback != nil {
 					// 注意：此处运行在gnet IO线程，回调不能耗时
-					tcpClient.msgCallback(connCtx.Msg, connCtx)
+					tcpClient.msgCallback(msg, connCtx)
 				}
-				connCtx.Msg = nil // 清空消息，准备下一次解码
 			}
 			continue // 继续解码下一个包
 

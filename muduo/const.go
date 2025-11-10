@@ -11,5 +11,6 @@ var (
 	ErrEmptyMsgType     = errors.New("rpc codec: Msg type is not initialized")   // 未初始化 Protobuf 消息类型（编码前未设置消息体）
 	ErrConsumeFailed    = errors.New("rpc codec: consume packet failed")         // 消费数据包失败（Discard/Read 操作失败）
 	// 新增 ErrInvalidMsgName：Protobuf 消息名无效（如长度不合法、FullName 不存在）
-	ErrInvalidMsgName = errors.New("rpc codec: invalid proto message name (length illegal or fullname not found)")
+	ErrInvalidMsgName   = errors.New("rpc codec: invalid proto message name (length illegal or fullname not found)")
+	ErrInvalidPacketLen = errors.New("invalid packet total length")
 )
