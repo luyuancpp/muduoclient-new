@@ -12,14 +12,21 @@ import (
 	"time"
 )
 
-// Codec: 编解码器接口（业务层实现，不变）
+// 全局错误定义（补充之前缺失的ErrInsufficientData）
+var ErrInsufficientData = errors.New("insufficient data for packet")
+
+// Codec: 编解码器接口（业务层实现）
 type Codec interface {
 	Encode(msg proto.Message) ([]byte, error)     // 编码Protobuf消息
-	Decode(conn gnet.Conn) (proto.Message, error) // 解码到ConnContext（需设置 connCtx.Msg）
+	Decode(conn gnet.Conn) (proto.Message, error) // 解码返回消息
 }
 
 // MessageCallback: 消息接收回调（业务层注册，接收完整消息后触发）
 type MessageCallback func(msg proto.Message, connCtx *ConnContext)
+
+// HeartbeatCallback: 心跳回调（业务层注册，定时触发，与OnTraffic同线程执行）
+// 入参为连接上下文，业务层可在此构造并发送心跳消息
+type HeartbeatCallback func(connCtx *ConnContext)
 
 // ------------------------------ 核心结构体 ------------------------------
 // ConnMeta: 连接元数据（嵌入到ConnContext）
@@ -28,25 +35,27 @@ type ConnMeta struct {
 	CreateAt time.Time // 连接建立时间
 }
 
-// ConnContext: 连接上下文（绑定到gnet.Conn，仅存储元数据和解码结果）
+// ConnContext: 连接上下文（绑定到gnet.Conn，仅存储元数据）
 type ConnContext struct {
 	ConnMeta // 嵌入元数据
 }
 
-// TcpClient: 精简TCP客户端（无chan，基于回调）
+// TcpClient: 精简TCP客户端（新增心跳回调相关字段）
 type TcpClient struct {
-	codec       Codec              // 编解码器
-	closed      atomic.Bool        // 关闭状态（原子变量）
-	ctx         context.Context    // 生命周期上下文
-	cancel      context.CancelFunc // 上下文取消函数
-	conn        atomic.Value       // 活跃连接（gnet.Conn）
-	wg          sync.WaitGroup     // 协程等待组（优雅关闭）
-	client      *gnet.Client       // gnet客户端实例
-	network     string             // 网络类型（固定tcp）
-	addr        string             // 服务器地址（ip:port）
-	multicore   bool               // gnet多核模式
-	connected   atomic.Bool        // 连接状态（原子变量）
-	msgCallback MessageCallback    // 消息回调（业务层注册）
+	codec             Codec              // 编解码器
+	closed            atomic.Bool        // 关闭状态（原子变量）
+	ctx               context.Context    // 生命周期上下文
+	cancel            context.CancelFunc // 上下文取消函数
+	conn              atomic.Value       // 活跃连接（gnet.Conn）
+	wg                sync.WaitGroup     // 协程等待组（优雅关闭）
+	client            *gnet.Client       // gnet客户端实例
+	network           string             // 网络类型（固定tcp）
+	addr              string             // 服务器地址（ip:port）
+	multicore         bool               // gnet多核模式
+	connected         atomic.Bool        // 连接状态（原子变量）
+	msgCallback       MessageCallback    // 消息回调（业务层注册）
+	heartbeatCallback HeartbeatCallback  // 心跳回调（业务层注册）
+	heartbeatInterval time.Duration      // 心跳间隔（业务层配置）
 }
 
 // tcpClientEvents: gnet事件处理器（绑定TcpClient）
@@ -55,15 +64,15 @@ type tcpClientEvents struct {
 	client                   *TcpClient
 }
 
-// ------------------------------ gnet事件回调（同步优化） ------------------------------
-// OnOpen: 连接建立时初始化上下文（移除cachedData初始化）
+// ------------------------------ gnet事件回调 ------------------------------
+// OnOpen: 连接建立时初始化上下文
 func (ev *tcpClientEvents) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
 	tcpClient := ev.client
 	if tcpClient.closed.Load() {
 		return nil, gnet.Close
 	}
 
-	// 初始化连接上下文（仅元数据，无cachedData）
+	// 初始化连接上下文（仅元数据）
 	connCtx := &ConnContext{
 		ConnMeta: ConnMeta{
 			ConnID:   uuid.NewString(),
@@ -112,22 +121,24 @@ func (ev *tcpClientEvents) OnClose(conn gnet.Conn, err error) gnet.Action {
 	return gnet.None
 }
 
-// OnTraffic: 数据接收（解码成功直接触发回调，无chan中转）
-// OnTraffic: 同一套逻辑兼容 TcpCodec 和 RpcCodec
+// OnTraffic: 数据接收（解码成功直接触发回调）
 func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
-	// 对于 RpcCodec，无需依赖 ConnContext 存储消息，仅需获取连接元数据（若需要）
-	connCtx, _ := conn.Context().(interface{}) // 兼容不同上下文结构
+	connCtx, ok := conn.Context().(*ConnContext)
+	if !ok {
+		connCtx = &ConnContext{}
+		conn.SetContext(connCtx)
+		return gnet.None
+	}
 
 	for {
-		// 调用编解码器解码（TcpCodec 和 RpcCodec 均返回 (proto.Message, error)）
+		// 调用编解码器解码
 		msg, decodeErr := tcpClient.codec.Decode(conn)
 
 		switch {
 		case decodeErr == nil:
 			if msg != nil && tcpClient.msgCallback != nil {
-				// 回调传递消息和连接上下文（若 RpcCodec 无需上下文，可忽略第二个参数）
-				tcpClient.msgCallback(msg, connCtx.(*ConnContext)) // 按需类型转换
+				tcpClient.msgCallback(msg, connCtx)
 			}
 			continue
 
@@ -135,7 +146,6 @@ func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 			return gnet.None
 
 		default:
-			// 日志中添加连接标识
 			remoteAddr := conn.RemoteAddr().String()
 			log.Printf("decode error (conn: %s): %v", remoteAddr, decodeErr)
 			return gnet.None
@@ -143,62 +153,69 @@ func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	}
 }
 
-// OnTick: 定时回调（支持心跳，默认关闭）
+// OnTick: 定时回调（触发心跳回调，与事件循环同线程）
 func (ev *tcpClientEvents) OnTick() (delay time.Duration, action gnet.Action) {
-	// 如需心跳，解开注释并配置间隔（示例10秒）
-	// delay = 10 * time.Second
-	// tcpClient := ev.client
-	// if !tcpClient.connected.Load() {
-	// 	return delay, gnet.None
-	// }
-	// conn, ok := tcpClient.conn.Load().(gnet.Conn)
-	// if ok && conn != nil {
-	// 	// 发送心跳消息（业务层替换为实际Protobuf）
-	// 	heartbeat := &pb.Heartbeat{ConnID: conn.Context().(*ConnContext).ConnID}
-	// 	_ = tcpClient.Send(heartbeat)
-	// }
+	tcpClient := ev.client
+
+	// 使用业务层配置的心跳间隔（默认10秒）
+	delay = tcpClient.heartbeatInterval
+	if delay <= 0 {
+		delay = 10 * time.Second
+	}
+
+	// 快速校验：客户端关闭/未连接/无心跳回调 → 跳过
+	if tcpClient.closed.Load() || !tcpClient.connected.Load() || tcpClient.heartbeatCallback == nil {
+		return delay, gnet.None
+	}
+
+	// 获取活跃连接和上下文
+	connVal := tcpClient.conn.Load()
+	conn, ok := connVal.(gnet.Conn)
+	if !ok || conn == nil {
+		log.Println("heartbeat skipped: no active connection")
+		return delay, gnet.None
+	}
+
+	connCtx, ok := conn.Context().(*ConnContext)
+	if !ok {
+		log.Println("heartbeat skipped: invalid connection context")
+		return delay, gnet.None
+	}
+
+	// 触发业务层心跳回调（在gnet事件循环线程执行）
+	tcpClient.heartbeatCallback(connCtx)
+
 	return delay, gnet.None
 }
 
-// ------------------------------ 核心拨号方法（适配gnet原生接口） ------------------------------
-// dial: 自定义拨号（使用gnet.DialContext，适配原生接口）
+// ------------------------------ 核心拨号方法 ------------------------------
 func (c *TcpClient) dial() (gnet.Conn, error) {
-	// 5秒拨号超时（绑定客户端生命周期上下文）
 	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
 	defer cancel()
-
-	// 调用gnet原生DialContext，建立TCP连接
-	// 关键：连接建立后会触发OnOpen回调，自动绑定ConnContext
 	return c.client.DialContext(c.network, c.addr, ctx)
 }
 
-// ------------------------------ 重连逻辑（修复） ------------------------------
-// reconnectLoop: 退避重连（避免频繁重试）
+// ------------------------------ 重连逻辑 ------------------------------
 func (c *TcpClient) reconnectLoop() {
 	reconnectDelay := 3 * time.Second // 初始间隔
 	maxDelay := 30 * time.Second      // 最大间隔
 	retryCount := 0
 
 	for {
-		// 客户端已关闭：终止重连
 		if c.closed.Load() {
 			log.Println("reconnect stopped: client closed")
 			return
 		}
 
-		// 退避等待
 		log.Printf("reconnect attempt %d (delay: %v) - target: %s", retryCount+1, reconnectDelay, c.addr)
 		time.Sleep(reconnectDelay)
 
-		// 调用自定义dial()，通过gnet原生接口建立连接
 		newConn, err := c.dial()
 		if err == nil {
-			// 连接建立成功：OnOpen已绑定上下文，直接更新原子变量
 			log.Printf("reconnect success (connID: %s)", newConn.Context().(*ConnContext).ConnID)
 			return
 		}
 
-		// 重连失败：更新退避间隔
 		retryCount++
 		reconnectDelay *= 2
 		if reconnectDelay > maxDelay {
@@ -209,22 +226,18 @@ func (c *TcpClient) reconnectLoop() {
 }
 
 // ------------------------------ 客户端配置与初始化 ------------------------------
-// ClientConfig: 客户端配置（精简）
 type ClientConfig struct {
 	Multicore bool // 是否启用gnet多核模式（单连接建议关闭）
 }
 
-// DefaultClientConfig: 默认配置（单连接最优）
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{Multicore: false}
 }
 
-// NewTcpClient: 快速创建客户端（使用默认配置）
 func NewTcpClient(addr string, codec Codec) *TcpClient {
 	return NewTcpClientWithConfig(addr, codec, DefaultClientConfig())
 }
 
-// NewTcpClientWithConfig: 全配置创建客户端
 func NewTcpClientWithConfig(addr string, codec Codec, conf *ClientConfig) *TcpClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &TcpClient{
@@ -236,37 +249,32 @@ func NewTcpClientWithConfig(addr string, codec Codec, conf *ClientConfig) *TcpCl
 		multicore: conf.Multicore,
 	}
 
-	// 启动gnet客户端协程
 	client.wg.Add(1)
 	go client.startGnetClient()
 
 	return client
 }
 
-// startGnetClient: 启动gnet引擎（核心修复，适配gnet原生接口）
 func (c *TcpClient) startGnetClient() {
 	defer c.wg.Done()
 
-	// 初始化gnet事件处理器
 	gnetEvents := &tcpClientEvents{
 		BuiltinEventEngine: &gnet.BuiltinEventEngine{},
 		client:             c,
 	}
 
-	// 创建gnet客户端（优化网络参数）
 	gnetClient, err := gnet.NewClient(
 		gnetEvents,
 		gnet.WithMulticore(c.multicore),
-		gnet.WithTCPNoDelay(gnet.TCPNoDelay), // 禁用Nagle，减少延迟
-		gnet.WithLockOSThread(true),          // 绑定线程，提升性能
-		gnet.WithTicker(true),                // 启用定时回调（支持心跳）
+		gnet.WithTCPNoDelay(gnet.TCPNoDelay),
+		gnet.WithLockOSThread(true),
+		gnet.WithTicker(true), // 启用定时回调（支持心跳）
 	)
 	if err != nil {
 		log.Fatalf("failed to create gnet client: %v", err)
 	}
 	c.client = gnetClient
 
-	// 延迟关闭gnet引擎
 	defer func() {
 		if err := c.client.Stop(); err != nil {
 			log.Printf("failed to stop gnet client: %v", err)
@@ -275,17 +283,14 @@ func (c *TcpClient) startGnetClient() {
 		}
 	}()
 
-	// 启动gnet引擎（非阻塞）
 	if err := c.client.Start(); err != nil {
 		log.Fatalf("failed to start gnet engine: %v", err)
 	}
 
-	// 建立初始连接（调用自定义dial()，适配gnet原生接口）
 	if _, err := c.dial(); err != nil {
 		log.Fatalf("failed to establish initial connection: %v", err)
 	}
 
-	// 阻塞等待客户端关闭信号
 	<-c.ctx.Done()
 	log.Println("gnet client coroutine exited")
 }
@@ -296,9 +301,18 @@ func (c *TcpClient) SetMessageCallback(callback MessageCallback) {
 	c.msgCallback = callback
 }
 
+// SetHeartbeatCallback: 注册心跳回调（业务层调用，与消息回调风格一致）
+// 间隔为0时使用默认10秒
+func (c *TcpClient) SetHeartbeatCallback(interval time.Duration, callback HeartbeatCallback) {
+	if callback == nil {
+		log.Panic("heartbeat callback cannot be nil")
+	}
+	c.heartbeatInterval = interval
+	c.heartbeatCallback = callback
+}
+
 // Send: 发送消息（非阻塞，线程安全）
 func (c *TcpClient) Send(msg proto.Message) error {
-	// 快速状态校验
 	if c.closed.Load() {
 		return errors.New("client closed")
 	}
@@ -306,13 +320,11 @@ func (c *TcpClient) Send(msg proto.Message) error {
 		return errors.New("not connected to server")
 	}
 
-	// 编码消息
 	data, err := c.codec.Encode(msg)
 	if err != nil {
 		return errors.Join(errors.New("encode message failed"), err)
 	}
 
-	// 原子获取活跃连接
 	connVal := c.conn.Load()
 	conn, ok := connVal.(gnet.Conn)
 	if !ok || conn == nil {
@@ -320,7 +332,6 @@ func (c *TcpClient) Send(msg proto.Message) error {
 	}
 	connCtx := conn.Context().(*ConnContext)
 
-	// 异步发送（gnet非阻塞写）
 	err = conn.AsyncWrite(data, func(_ gnet.Conn, writeErr error) error {
 		if writeErr != nil {
 			log.Printf("send failed (connID: %s, dataLen: %d): %v", connCtx.ConnID, len(data), writeErr)
@@ -336,17 +347,14 @@ func (c *TcpClient) Send(msg proto.Message) error {
 
 // Close: 优雅关闭客户端（线程安全）
 func (c *TcpClient) Close() {
-	// 确保只关闭一次
 	if !c.closed.CompareAndSwap(false, true) {
 		log.Println("client already closed")
 		return
 	}
 	log.Println("starting to close client")
 
-	// 触发所有协程退出
 	c.cancel()
 
-	// 关闭活跃连接（避免连接泄露）
 	connVal := c.conn.Load()
 	if connVal != nil {
 		conn, ok := connVal.(gnet.Conn)
@@ -355,10 +363,8 @@ func (c *TcpClient) Close() {
 		}
 	}
 
-	// 等待gnet协程退出
 	c.wg.Wait()
 
-	// 更新连接状态
 	c.connected.Store(false)
 	log.Println("client closed completely")
 }
