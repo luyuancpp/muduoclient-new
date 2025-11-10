@@ -7,15 +7,13 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"hash/adler32"
-	"io"
 	"log"
 )
 
 // ------------------------------ 连接上下文与编解码器结构体 ------------------------------
-// rpcConnContext：gnet连接上下文，存储缓存数据和解码结果
+// rpcConnContext：gnet连接上下文，仅存储解码结果（不存数据缓存）
 type rpcConnContext struct {
-	cachedData []byte        // 暂存未完整解码的数据（处理拆包）
-	msg        proto.Message // 解码成功后的Protobuf消息
+	msg proto.Message // 解码成功后的Protobuf消息
 }
 
 // RpcCodec：RPC协议编解码器（基于Protobuf+TCP）
@@ -32,6 +30,7 @@ func NewRpcCodec(msgType proto.Message) *RpcCodec {
 }
 
 // ------------------------------ 编码逻辑（Encode） ------------------------------
+// 保留原有逻辑，协议格式不变：[4字节总长度] + [4字节"RPC0"标签] + [消息体] + [4字节校验和]
 func (c *RpcCodec) Encode(msg proto.Message) ([]byte, error) {
 	// 1. 校验消息合法性
 	if msg == nil {
@@ -77,14 +76,12 @@ func (c *RpcCodec) Encode(msg proto.Message) ([]byte, error) {
 }
 
 // ------------------------------ 解码逻辑（Decode） ------------------------------
-// Decode：从gnet连接解码RPC消息，结果存储在rpcConnContext.msg中
+// 重构核心：完全基于gnet缓冲区操作，无本地缓存，解决Discard同步问题
 func (c *RpcCodec) Decode(conn gnet.Conn) error {
-	// 1. 初始化/获取连接上下文（确保每个连接有独立缓存）
+	// 1. 初始化/获取连接上下文（仅存解码结果，无数据缓存）
 	ctx, ok := conn.Context().(*rpcConnContext)
 	if !ok {
-		ctx = &rpcConnContext{
-			cachedData: make([]byte, 0, 4096), // 预分配4KB缓存，减少扩容开销
-		}
+		ctx = &rpcConnContext{}
 		conn.SetContext(ctx)
 	}
 
@@ -93,65 +90,66 @@ func (c *RpcCodec) Decode(conn gnet.Conn) error {
 		return ErrEmptyMsgType
 	}
 
-	// 3. 循环解析：处理粘包/拆包（一次解析一个完整包，避免阻塞事件循环）
+	// 3. 循环解析：处理粘包/拆包（一次解析一个完整包）
 	for {
-		// 3.1 合并历史缓存与新数据（Peek非消费式，不修改内核缓冲区指针）
-		newData, err := conn.Peek(0)
-		if err != nil && err != io.EOF {
-			return errors.Join(errors.New("rpc codec: peek new data failed"), err)
-		}
-		fullData := append(ctx.cachedData, newData...)
-		ctx.cachedData = ctx.cachedData[:0] // 清空旧缓存，避免重复处理
-
-		// 3.2 第一步：校验总长度前缀（至少4字节）
-		if len(fullData) < 4 {
-			ctx.cachedData = append(ctx.cachedData, fullData...) // 缓存不足数据
+		// 3.1 第一步：检查缓冲区是否有足够数据解析总长度前缀（4字节）
+		if conn.InboundBuffered() < 4 {
 			return ErrInsufficientData
 		}
 
-		// 3.3 第二步：解析总长度，判断是否有完整包
-		totalDataLen := binary.BigEndian.Uint32(fullData[:4]) // Payload + 校验和长度
-		requiredTotalLen := 4 + int(totalDataLen)             // 完整包总长度（4字节长度+数据）
-		if len(fullData) < requiredTotalLen {
-			ctx.cachedData = append(ctx.cachedData, fullData...) // 缓存不足数据
+		// 3.2 解析总长度前缀（不消费数据）
+		totalLenBuf, err := conn.Peek(4)
+		if err != nil {
+			return errors.Join(errors.New("rpc codec: peek total length failed"), err)
+		}
+		totalDataLen := binary.BigEndian.Uint32(totalLenBuf)
+		requiredTotalLen := 4 + int(totalDataLen) // 完整包总长度（4字节前缀 + 数据部分）
+
+		// 3.3 校验总长度合理性（避免恶意数据或协议错误）
+		if totalDataLen == 0 || requiredTotalLen > 10*1024*1024 { // 最大10MB
+			log.Printf("rpc codec: invalid totalDataLen %d (conn: %s)", totalDataLen, conn.RemoteAddr())
+			conn.Discard(4) // 丢弃无效的长度前缀
+			return ErrInvalidPacketLen
+		}
+
+		// 3.4 检查缓冲区是否有完整包（实时状态，无同步问题）
+		if conn.InboundBuffered() < requiredTotalLen {
 			return ErrInsufficientData
 		}
 
-		// -------------------------- 核心优化：统一用defer Discard消费数据 --------------------------
-		// 仅在确认有完整包后，绑定defer Discard（避免重复消费）
-		defer func() {
-			discarded, discardErr := conn.Discard(requiredTotalLen)
-			if discardErr != nil {
-				log.Printf("rpc codec: discard failed (required %d, discarded %d): %v", requiredTotalLen, discarded, discardErr)
-			} else if discarded != requiredTotalLen {
-				log.Printf("rpc codec: discard length mismatch (required %d, discarded %d)", requiredTotalLen, discarded)
-			}
-		}()
+		// 3.5 Peek完整包数据（不消费，仅读取）
+		fullPacket, err := conn.Peek(requiredTotalLen)
+		if err != nil {
+			return errors.Join(errors.New("rpc codec: peek full packet failed"), err)
+		}
 
-		// 3.4 第三步：提取Payload和校验和（与编码逻辑严格对齐）
+		// 3.6 提取Payload和校验和（与编码逻辑严格对齐）
 		payloadEnd := 4 + int(totalDataLen) - 4 // Payload结束位置（排除4字节校验和）
-		payload := fullData[4:payloadEnd]
-		checksumExpected := binary.BigEndian.Uint32(fullData[payloadEnd:requiredTotalLen])
+		payload := fullPacket[4:payloadEnd]
+		checksumExpected := binary.BigEndian.Uint32(fullPacket[payloadEnd:requiredTotalLen])
 
-		// 3.5 第四步：校验和验证（检测数据篡改或传输错误）
+		// 3.7 校验和验证（检测数据篡改或传输错误）
 		if adler32.Checksum(payload) != checksumExpected {
-			log.Println("rpc codec:", ErrInvalidChecksum)
-			return ErrInvalidChecksum // 退出后defer会自动消费错误包
+			log.Printf("rpc codec: invalid checksum (conn: %s)", conn.RemoteAddr())
+			conn.Discard(requiredTotalLen) // 立即丢弃无效包
+			return ErrInvalidChecksum
 		}
 
-		// 3.6 第五步：校验RPC标签（确保是目标RPC包，过滤无效数据）
+		// 3.8 校验RPC标签（确保是目标RPC包，过滤无效数据）
 		if len(payload) < 4 || string(payload[:4]) != "RPC0" {
-			log.Println("rpc codec:", ErrInvalidTag)
-			return ErrInvalidTag // 退出后defer会自动消费错误包
+			log.Printf("rpc codec: invalid tag (conn: %s)", conn.RemoteAddr())
+			conn.Discard(requiredTotalLen) // 立即丢弃无效包
+			return ErrInvalidTag
 		}
 
-		// 3.7 第六步：提取消息体并反序列化
+		// 3.9 提取消息体并反序列化
 		body := payload[4:] // 去掉"RPC0"标签，获取纯消息体
 		// 从Protobuf全局注册表查找消息类型（基于预定义的MsgType）
 		msgTypeName := c.MsgType.ProtoReflect().Descriptor().FullName()
 		msgType, err := protoregistry.GlobalTypes.FindMessageByName(msgTypeName)
 		if err != nil {
-			log.Printf("rpc codec: find message type failed (name=%s): %v", msgTypeName, err)
+			log.Printf("rpc codec: find message type failed (name=%s, conn: %s): %v", msgTypeName, conn.RemoteAddr(), err)
+			conn.Discard(requiredTotalLen)
 			return errors.Join(errors.New("rpc codec: find message type failed"), err)
 		}
 
@@ -162,22 +160,21 @@ func (c *RpcCodec) Decode(conn gnet.Conn) error {
 			DiscardUnknown: true,  // 忽略未知字段（提高兼容性）
 		}
 		if err := unmarshalOptions.Unmarshal(body, msg); err != nil {
-			log.Printf("rpc codec: unmarshal body failed: %v", err)
+			log.Printf("rpc codec: unmarshal body failed (conn: %s): %v", conn.RemoteAddr(), err)
+			conn.Discard(requiredTotalLen)
 			return errors.Join(errors.New("rpc codec: unmarshal body failed"), err)
 		}
 
-		// 3.8 第七步：缓存剩余数据（粘包场景，供下次解码）
-		if len(fullData) > requiredTotalLen {
-			ctx.cachedData = append(ctx.cachedData, fullData[requiredTotalLen:]...)
+		// 3.10 关键：解析成功后，立即消费缓冲区数据（无延迟，无同步问题）
+		if _, err := conn.Discard(requiredTotalLen); err != nil {
+			log.Printf("rpc codec: discard packet failed (conn: %s): %v", conn.RemoteAddr(), err)
+			return errors.Join(errors.New("rpc codec: discard packet failed"), err)
 		}
 
-		// 3.9 保存解码结果到上下文
+		// 3.11 保存解码结果到上下文
 		ctx.msg = msg
-		break // 解析成功一个包，退出循环（避免单次处理过多包导致阻塞）
+		break // 解析成功一个包，退出循环（避免阻塞事件循环）
 	}
 
 	return nil
 }
-
-// ------------------------------ 辅助函数：移除重复的consumePacket ------------------------------
-// 说明：原代码中的consumePacket已被defer Discard替代，故移除；若需保留，需确保与Discard不重复调用

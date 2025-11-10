@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// 补充全局错误定义（确保编解码器的 ErrInsufficientData 在此可见）
+var (
+	ErrInsufficientData = errors.New("insufficient data for packet")
+)
+
 // Codec: 编解码器接口（业务层实现，不变）
 type Codec interface {
 	Encode(msg proto.Message) ([]byte, error) // 编码Protobuf消息
@@ -28,11 +33,11 @@ type ConnMeta struct {
 	CreateAt time.Time // 连接建立时间
 }
 
-// ConnContext: 连接上下文（绑定到gnet.Conn，存储解码状态+元数据）
+// ConnContext: 连接上下文（绑定到gnet.Conn，仅存储元数据和解码结果）
 type ConnContext struct {
-	ConnMeta                 // 嵌入元数据
-	Msg        proto.Message // 解码后的完整消息（Decode成功后设置）
-	cachedData []byte        // 拆包剩余缓冲数据
+	ConnMeta               // 嵌入元数据
+	Msg      proto.Message // 解码后的完整消息（Decode成功后设置）
+	// 核心优化：移除 cachedData 字段（编解码器已不依赖本地缓存）
 }
 
 // TcpClient: 精简TCP客户端（无chan，基于回调）
@@ -57,21 +62,20 @@ type tcpClientEvents struct {
 	client                   *TcpClient
 }
 
-// ------------------------------ gnet事件回调（核心改造） ------------------------------
-// OnOpen: 连接建立时初始化上下文（关键：所有连接都通过此回调绑定上下文）
+// ------------------------------ gnet事件回调（同步优化） ------------------------------
+// OnOpen: 连接建立时初始化上下文（移除cachedData初始化）
 func (ev *tcpClientEvents) OnOpen(conn gnet.Conn) (out []byte, action gnet.Action) {
 	tcpClient := ev.client
 	if tcpClient.closed.Load() {
 		return nil, gnet.Close
 	}
 
-	// 初始化连接上下文（元数据+缓冲）
+	// 初始化连接上下文（仅元数据，无cachedData）
 	connCtx := &ConnContext{
 		ConnMeta: ConnMeta{
 			ConnID:   uuid.NewString(),
 			CreateAt: time.Now(),
 		},
-		cachedData: make([]byte, 0, 4096), // 4KB缓冲（可根据协议调整）
 	}
 	conn.SetContext(connCtx)
 
@@ -120,15 +124,15 @@ func (ev *tcpClientEvents) OnTraffic(conn gnet.Conn) (action gnet.Action) {
 	tcpClient := ev.client
 	connCtx, ok := conn.Context().(*ConnContext)
 	if !ok {
-		// 双重保证：若未初始化则创建默认上下文
-		connCtx = &ConnContext{cachedData: make([]byte, 0, 4096)}
+		// 双重保证：创建无cachedData的默认上下文
+		connCtx = &ConnContext{}
 		conn.SetContext(connCtx)
 		return gnet.None
 	}
 
 	// 循环解码：处理所有可读的完整包
 	for {
-		// 调用编解码器解码（业务层实现，需正确设置 connCtx.Msg 和 cachedData）
+		// 调用编解码器解码（编解码器已基于gnet缓冲区，无本地缓存依赖）
 		decodeErr := tcpClient.codec.Decode(conn)
 
 		switch {
